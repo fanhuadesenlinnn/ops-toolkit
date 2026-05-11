@@ -9,6 +9,7 @@
 | 脚本 | 用途 | 状态 |
 | --- | --- | --- |
 | [`sshm.sh`](./sshm.sh) | SSH 主机管理脚本，支持保存主机、按别名或 ID 连接、增删改查、搜索和备注。 | 可用 |
+| [`linux-admin-toolkit.sh`](./linux-admin-toolkit.sh) | Linux/macOS 运维工具箱，覆盖常用工具安装、软件源、Docker、防火墙、Swap/LVM 和性能排查。 | 可用 |
 
 ## 当前工具
 
@@ -47,6 +48,44 @@
 ```bash
 SSHM_CONFIG_FILE=/path/to/hosts ./sshm.sh --list
 ```
+
+### linux-admin-toolkit.sh
+
+`linux-admin-toolkit.sh` 是一个面向 Linux/macOS 的综合运维脚本，适合初始化环境、调整基础配置和做常见排查。
+
+主要功能：
+
+- 安装和配置常用工具、Shell 环境、Zsh/Oh My Zsh、rupa/z 等。
+- 管理系统软件源，支持官方源和常见镜像源。
+- 安装 Docker、配置镜像加速、导出镜像和查看 Docker 状态。
+- 管理防火墙、Swap 和 LVM。
+- 快速查看系统环境并执行基础性能瓶颈排查。
+- 支持 `--dry-run` 预览命令，适合在生产环境执行前确认影响。
+
+常用命令：
+
+```bash
+./linux-admin-toolkit.sh --help
+./linux-admin-toolkit.sh menu
+./linux-admin-toolkit.sh env
+./linux-admin-toolkit.sh tools install
+./linux-admin-toolkit.sh mirror set --source tuna
+./linux-admin-toolkit.sh docker install --source tuna
+./linux-admin-toolkit.sh firewall status
+./linux-admin-toolkit.sh swap add --size 4G --path /swapfile
+./linux-admin-toolkit.sh lvm list
+./linux-admin-toolkit.sh perf quick
+```
+
+全局选项：
+
+```bash
+-y, --yes       默认确认
+-n, --dry-run   只打印不执行
+--no-color      禁用颜色
+```
+
+多数系统配置类操作需要管理员权限，执行前建议先使用 `--dry-run` 观察将要执行的命令。
 
 ## 计划收录方向
 
