@@ -51,8 +51,8 @@ trim() {
 
 expand_path() {
     case "$1" in
-        "~") printf "%s" "$HOME" ;;
-        "~/"*) printf "%s/%s" "$HOME" "${1#~/}" ;;
+        \~) printf "%s" "$HOME" ;;
+        \~/*) printf "%s/%s" "$HOME" "${1#~/}" ;;
         *) printf "%s" "$1" ;;
     esac
 }
@@ -127,7 +127,7 @@ EOF
 
 parse_record() {
     # 将一行配置拆到全局变量，便于多个函数复用。
-    IFS=',' read -r REC_ALIAS REC_USER REC_HOST REC_PORT REC_IDENTITY REC_NOTE REC_EXTRA <<EOF
+    IFS=',' read -r REC_ALIAS REC_USER REC_HOST REC_PORT REC_IDENTITY REC_NOTE _REC_EXTRA <<EOF
 $1
 EOF
 }

@@ -81,8 +81,8 @@ has_cmd() { cmd_path "${1:-}" >/dev/null 2>&1; }
 
 trim_string() {
   local s="${1:-}"
-  s="${s#${s%%[![:space:]]*}}"
-  s="${s%${s##*[![:space:]]}}"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
   printf '%s' "$s"
 }
 
@@ -595,7 +595,7 @@ tool_status() {
   done < <(common_tool_commands)
   echo
   if [[ "$missing" -gt 0 ]]; then
-    warn "缺少 ${missing} 个命令，可先执行“安装常用工具”。"
+    warn "缺少 ${missing} 个命令，可先执行 '安装常用工具'。"
   else
     success "常用工具命令检测通过。"
   fi
@@ -839,6 +839,7 @@ EOF_ZSHRC
     chown_target "$zshrc"
   else
     if ! grep -q 'oh-my-zsh.sh' "$zshrc" 2>/dev/null; then
+      # shellcheck disable=SC2016 # 写入到用户 .zshrc 后才应展开 $HOME/$ZSH。
       write_managed_block "$zshrc" "oh-my-zsh" 'export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="robbyrussell"
 plugins=(git)
@@ -891,6 +892,7 @@ install_rupa_z() {
   chown_target "$home/.local" "$home/.local/share"
   clone_or_update_repo "https://github.com/rupa/z.git" "$dest" "$proxy"
   [[ -f "$dest/z.sh" ]] || fatal "rupa/z 安装校验失败：缺少 $dest/z.sh"
+  # shellcheck disable=SC2016 # 写入到用户 shell 配置后才应展开 $HOME。
   block='if [ -f "$HOME/.local/share/z/z.sh" ]; then
   . "$HOME/.local/share/z/z.sh"
 fi'
@@ -1238,7 +1240,7 @@ set_rpm_mirror() {
   local source="${1:-$DEFAULT_SOURCE}" base
   source_base_url "$source" >/dev/null || return 1
   if [[ "$source" == "official" ]]; then
-    skipped "RPM 系发行版官方源格式差异较大，脚本不强制重写为官方源。海外环境通常保持默认源即可；如需回滚，请使用“恢复备份”。"
+    skipped "RPM 系发行版官方源格式差异较大，脚本不强制重写为官方源。海外环境通常保持默认源即可；如需回滚，请使用 '恢复备份'。"
   fi
   base="$(source_base_url "$source")"
   backup_sources
@@ -1781,7 +1783,11 @@ swap_resize() {
 lvm_list() {
   ensure_linux_only "macOS 不支持 Linux LVM。"
   has_cmd lsblk && lsblk || true
-  has_cmd pvs && pvs || warn "缺少 pvs，请先安装 lvm2。"
+  if has_cmd pvs; then
+    pvs
+  else
+    warn "缺少 pvs，请先安装 lvm2。"
+  fi
   has_cmd vgs && vgs || true
   has_cmd lvs && lvs || true
 }
