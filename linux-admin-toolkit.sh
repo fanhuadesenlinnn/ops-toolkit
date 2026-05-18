@@ -31,8 +31,8 @@ error() { _color "1;31" "[ERROR] $*" >&2; }
 fatal() { error "$*"; exit 1; }
 
 format_cmd() { local arg quoted out=""; for arg in "$@"; do printf -v quoted '%q' "$arg"; out="${out}${out:+ }${quoted}"; done; printf '%s' "$out"; }
-run() { info "+ $(format_cmd "$@")"; [[ "$DRY_RUN" -eq 0 ]] && "$@"; }
-run_shell() { info "+ $*"; [[ "$DRY_RUN" -eq 0 ]] && bash -Eeuo pipefail -c "$*"; }
+run() { info "+ $(format_cmd "$@")"; [[ "$DRY_RUN" -eq 1 ]] && return 0; "$@"; }
+run_shell() { info "+ $*"; [[ "$DRY_RUN" -eq 1 ]] && return 0; bash -Eeuo pipefail -c "$*"; }
 cmd_path() { local cmd="${1:-}" d; [[ -n "$cmd" ]] || return 1; command -v "$cmd" 2>/dev/null && return 0; for d in /opt/homebrew/bin /opt/homebrew/sbin /usr/local/bin /usr/local/sbin /usr/bin /bin /usr/sbin /sbin; do [[ -x "$d/$cmd" ]] && { printf '%s\n' "$d/$cmd"; return 0; }; done; return 1; }
 has_cmd() { cmd_path "${1:-}" >/dev/null 2>&1; }
 trim_string() { local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
@@ -46,7 +46,7 @@ run_privileged() { if [[ "${EUID}" -eq 0 ]]; then run "$@"; else has_cmd sudo ||
 write_file() { local file="$1" dir; dir="$(dirname "$file")"; if [[ "$DRY_RUN" -eq 1 ]]; then info "+ write file $file"; cat >/dev/null; return 0; fi; mkdir -p "$dir"; cat > "$file"; }
 append_file() { local file="$1" dir; dir="$(dirname "$file")"; if [[ "$DRY_RUN" -eq 1 ]]; then info "+ append file $file"; cat >/dev/null; return 0; fi; mkdir -p "$dir"; cat >> "$file"; }
 append_line_if_missing() { local file="$1" line="$2" dir; dir="$(dirname "$file")"; [[ "$DRY_RUN" -eq 1 ]] && { info "+ append line to $file if missing: $line"; return 0; }; mkdir -p "$dir"; touch "$file"; grep -qxF "$line" "$file" 2>/dev/null || printf '%s\n' "$line" >> "$file"; }
-backup_file_if_exists() { local file="$1"; [[ -e "$file" ]] && run cp -a "$file" "$file.bak.$(date +%Y%m%d-%H%M%S)"; }
+backup_file_if_exists() { local file="$1"; [[ -e "$file" ]] || return 0; run cp -a "$file" "$file.bak.$(date +%Y%m%d-%H%M%S)"; }
 
 # ---------- 系统检测 ----------
 detect_os() {
@@ -67,7 +67,7 @@ is_arch() { [[ "$PKG_MANAGER" == "pacman" || "$OS_ID" == "arch" || "$OS_LIKE" ==
 is_fedora() { [[ "$OS_ID" == "fedora" ]]; }
 is_kylin() { [[ "$OS_ID" == *kylin* || "$OS_NAME" == *麒麟* || "$OS_NAME" == *Kylin* ]]; }
 require_root() { is_macos && return 0; if [[ "${EUID}" -ne 0 ]]; then if has_cmd sudo; then warn "需要 root 权限，正在尝试 sudo 重新执行。"; exec sudo -E bash "$0" "$@"; fi; fatal "请使用 root 用户运行，或先安装 sudo。"; fi; }
-get_codename() { is_macos || is_arch && { printf ''; return; }; [[ -n "$OS_CODENAME" ]] && { printf '%s' "$OS_CODENAME"; return; }; has_cmd lsb_release && { lsb_release -sc 2>/dev/null && return; }; [[ -r /etc/debian_version ]] && case "$(cut -d. -f1 /etc/debian_version 2>/dev/null || true)" in 13) printf trixie ;; 12) printf bookworm ;; 11) printf bullseye ;; 10) printf buster ;; *) printf '' ;; esac; }
+get_codename() { is_macos || is_arch && { printf ''; return 0; }; [[ -n "$OS_CODENAME" ]] && { printf '%s' "$OS_CODENAME"; return 0; }; has_cmd lsb_release && { lsb_release -sc 2>/dev/null && return 0; }; if [[ -r /etc/debian_version ]]; then case "$(cut -d. -f1 /etc/debian_version 2>/dev/null || true)" in 13) printf trixie ;; 12) printf bookworm ;; 11) printf bullseye ;; 10) printf buster ;; *) printf '' ;; esac; fi; return 0; }
 print_env() { cat <<EOF_ENV
 脚本版本：${TOOL_VERSION}
 平台：${PLATFORM:-unknown}
@@ -81,6 +81,7 @@ CODENAME：$(get_codename)
 内核：$(uname -r)
 EOF_ENV
 is_macos && { brew_bin >/dev/null 2>&1 && echo "Homebrew：$(brew_bin)" || echo "Homebrew：未安装"; }
+return 0
 }
 
 target_user_name() { if [[ "${EUID}" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER:-}" != "root" ]]; then printf '%s' "$SUDO_USER"; else id -un 2>/dev/null || printf root; fi; }
