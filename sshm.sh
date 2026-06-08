@@ -15,6 +15,9 @@
 #
 #==============================================================================
 
+set -Eeuo pipefail
+IFS=$'\n\t'
+
 VERSION="2.0.0"
 CONFIG_FILE="${SSHM_CONFIG_FILE:-$HOME/.sshm_hosts}"
 
@@ -51,8 +54,8 @@ trim() {
 
 expand_path() {
     case "$1" in
-        \~) printf "%s" "$HOME" ;;
-        \~/*) printf "%s/%s" "$HOME" "${1#~/}" ;;
+        ~) printf "%s" "$HOME" ;;
+        ~/*) printf "%s/%s" "$HOME" "${1#~/}" ;;
         *) printf "%s" "$1" ;;
     esac
 }

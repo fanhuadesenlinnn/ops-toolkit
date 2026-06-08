@@ -19,6 +19,27 @@ CANCEL_RC=130
 SKIP_RC=100
 DEFAULT_SOURCE="${LINUX_ADMIN_SOURCE:-official}"
 DEFAULT_DOCKER_SOURCE="${LINUX_ADMIN_DOCKER_SOURCE:-official}"
+# ---------- Docker 离线安装变量 ----------
+OFFLINE_STATE_DIR="/var/lib/docker-offline-installer"
+OFFLINE_MANIFEST_FILE="$OFFLINE_STATE_DIR/manifest"
+OFFLINE_BACKUP_MANIFEST_FILE="$OFFLINE_STATE_DIR/backup-manifest"
+OFFLINE_RESOURCE_DIR="./resources"
+OFFLINE_DOCKER_VERSION="latest"
+OFFLINE_COMPOSE_VERSION="latest"
+OFFLINE_DOCKER_CHANNEL="stable"
+OFFLINE_ARCH_OVERRIDE=""
+OFFLINE_DOWNLOAD_IF_MISSING=0
+OFFLINE_SKIP_DOCKER=0
+OFFLINE_SKIP_COMPOSE=0
+OFFLINE_PURGE_DATA=0
+OFFLINE_PACKAGE_FILE=""
+OFFLINE_DATA_ROOT=""
+OFFLINE_REGISTRY_MIRROR=""
+OFFLINE_DOCKER_URL_TEMPLATE="https://download.docker.com/linux/static/{channel}/{arch}/docker-{version}.tgz"
+OFFLINE_COMPOSE_URL_TEMPLATE="https://github.com/docker/compose/releases/download/v{version}/docker-compose-linux-{arch}"
+OFFLINE_COMPOSE_LATEST_URL_TEMPLATE="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-{arch}"
+OFFLINE_DOCKER_ARCH=""
+OFFLINE_COMPOSE_ARCH=""
 GITHUB_PROXY_PREFIX="${GITHUB_PROXY_PREFIX:-}"
 CHOSEN_MIRROR_SOURCE=""
 OS_ID=""; OS_LIKE=""; OS_NAME=""; OS_VERSION_ID=""; OS_CODENAME=""; PKG_MANAGER=""; PLATFORM=""
@@ -246,7 +267,7 @@ menu_set_system_mirror() { local s; choose_mirror_source; s="$CHOSEN_MIRROR_SOUR
 # ---------- Docker ----------
 registry_mirrors_json() { local input="$1" old_ifs item out="[" sep=""; old_ifs="$IFS"; IFS=','; for item in $input; do item="$(trim_string "$item")"; [[ -n "$item" ]] || continue; validate_url_value "$item"; out="${out}${sep}\"${item}\""; sep=", "; done; IFS="$old_ifs"; [[ "$out" != "[" ]] || fatal "未输入有效的 registry mirror URL。"; printf '%s]' "$out"; }
 docker_repo_base() { local s="${1:-$DEFAULT_DOCKER_SOURCE}"; case "$s" in official) printf 'https://download.docker.com' ;; tuna) printf 'https://mirrors.tuna.tsinghua.edu.cn/docker-ce' ;; ustc) printf 'https://mirrors.ustc.edu.cn/docker-ce' ;; aliyun) printf 'https://mirrors.aliyun.com/docker-ce' ;; tencent) printf 'https://mirrors.cloud.tencent.com/docker-ce' ;; bfsu) printf 'https://mirrors.bfsu.edu.cn/docker-ce' ;; custom:*|http://*|https://*) source_base_url "$s" ;; *) fatal "未知 Docker 源：$s" ;; esac; }
-docker_repo_os() { [[ "$OS_ID" == ubuntu || "$OS_LIKE" == *ubuntu* ]] && printf ubuntu || { [[ "$OS_ID" == debian || "$OS_LIKE" == *debian* ]] && printf debian || { is_fedora && printf fedora || printf centos; }; }; }
+docker_repo_os() { if [[ "$OS_ID" == ubuntu || "$OS_LIKE" == *ubuntu* ]]; then printf ubuntu; elif [[ "$OS_ID" == debian || "$OS_LIKE" == *debian* ]]; then printf debian; elif is_fedora; then printf fedora; else printf centos; fi; }
 remove_old_docker_conflicts() { [[ "$PKG_MANAGER" == pacman ]] && return 0; [[ "$PKG_MANAGER" == apt ]] && pkg_remove docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc || pkg_remove docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine podman-docker || true; }
 install_docker_macos() { ensure_brew; brew_run install --cask docker-desktop; success "Docker Desktop 已安装。首次使用请从 Applications 启动 Docker。"; }
 install_docker_pacman() { pkg_install docker docker-compose; }
@@ -269,6 +290,455 @@ fi; has_cmd systemctl && { run systemctl daemon-reload; run systemctl restart do
 save_docker_images_one_by_one() { has_cmd docker || fatal "未检测到 docker 命令。"; docker info >/dev/null 2>&1 || fatal "Docker daemon 不可用。"; local dir="${1:-}" image safe out count=0; [[ -z "$dir" ]] && { read -r -p "输入镜像导出目录 [${HOME:-/root}/docker-images]: " dir; dir="${dir:-${HOME:-/root}/docker-images}"; }; run mkdir -p "$dir"; while IFS= read -r image; do [[ -n "$image" ]] || continue; safe="$(printf '%s' "$image" | tr '/:@' '___')"; out="$dir/${safe}.tar.gz"; info "导出镜像：${image} -> ${out}"; if [[ "$DRY_RUN" -eq 1 ]]; then count=$((count + 1)); continue; fi; docker save "$image" | gzip > "$out"; [[ -s "$out" ]] || fatal "导出失败：$out"; count=$((count + 1)); done < <(docker images --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>' || true); success "Docker 镜像导出完成，数量：${count}。"; }
 uninstall_docker() { local remove_data="${1:-0}"; confirm "即将卸载 Docker 相关软件包。是否继续？" || cancelled; if is_macos; then ensure_brew; brew_run uninstall --cask docker-desktop || true; success "Docker Desktop 卸载完成。"; return 0; fi; has_cmd systemctl && run systemctl stop docker || true; [[ "$PKG_MANAGER" == pacman ]] && pkg_remove docker docker-compose || pkg_remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras || true; [[ "$remove_data" == 1 ]] && confirm "确认删除 /var/lib/docker /var/lib/containerd？" && run rm -rf /var/lib/docker /var/lib/containerd; success "Docker 卸载完成。"; }
 menu_docker_status() { if is_macos; then [[ -d /Applications/Docker.app || -d "$(target_user_home)/Applications/Docker.app" ]] && success "Docker Desktop App 已安装。" || warn "未检测到 Docker Desktop App。"; has_cmd docker && docker version || warn "当前 PATH 中未检测到 docker CLI。"; return 0; fi; has_cmd systemctl && systemctl status docker --no-pager 2>/dev/null && return 0; has_cmd docker && docker version || warn "未检测到 docker 命令。"; }
+
+# ---------- Docker 离线安装 ----------
+offline_detect_arch() {
+  local raw="${OFFLINE_ARCH_OVERRIDE:-$(uname -m)}"
+  case "$raw" in
+    x86_64|amd64) OFFLINE_DOCKER_ARCH="x86_64"; OFFLINE_COMPOSE_ARCH="x86_64" ;;
+    aarch64|arm64) OFFLINE_DOCKER_ARCH="aarch64"; OFFLINE_COMPOSE_ARCH="aarch64" ;;
+    *) fatal "暂不支持架构：$raw。建议使用 x86_64 或 aarch64。" ;;
+  esac
+  info "Docker 离线安装使用架构：Docker=$OFFLINE_DOCKER_ARCH Compose=$OFFLINE_COMPOSE_ARCH"
+}
+offline_replace_placeholders() {
+  local s="$1"
+  s="${s//\{channel\}/$OFFLINE_DOCKER_CHANNEL}"
+  s="${s//\{arch\}/$OFFLINE_DOCKER_ARCH}"
+  s="${s//\{version\}/$OFFLINE_DOCKER_VERSION}"
+  printf '%s' "$s"
+}
+offline_replace_compose_placeholders() {
+  local s="$1"
+  s="${s//\{arch\}/$OFFLINE_COMPOSE_ARCH}"
+  s="${s//\{version\}/$OFFLINE_COMPOSE_VERSION}"
+  printf '%s' "$s"
+}
+offline_download_file() {
+  local url="$1" out="$2"
+  run mkdir -p "$(dirname "$out")"
+  info "下载：$url"
+  if has_cmd curl; then
+    run curl -fL --retry 3 --connect-timeout 20 -o "$out.tmp" "$url"
+  elif has_cmd wget; then
+    run wget -O "$out.tmp" "$url"
+  else
+    fatal "缺少 curl 或 wget，无法下载。"
+  fi
+  run mv -f "$out.tmp" "$out"
+}
+offline_fetch_text() {
+  local url="$1"
+  if has_cmd curl; then curl -fsL --connect-timeout 20 "$url"; elif has_cmd wget; then wget -qO- "$url"; else return 1; fi
+}
+offline_resolve_latest_docker_online() {
+  local index_url="https://download.docker.com/linux/static/${OFFLINE_DOCKER_CHANNEL}/${OFFLINE_DOCKER_ARCH}/"
+  local latest
+  latest="$(offline_fetch_text "$index_url" \
+    | grep -oE 'docker-[0-9]+(\.[0-9]+)+(-ce)?\.tgz' \
+    | sed -E 's/^docker-//; s/\.tgz$//; s/-ce$//' \
+    | sort -Vu \
+    | tail -n 1 || true)"
+  [[ -n "$latest" ]] || fatal "无法解析 Docker latest 版本，请显式指定 --docker-version。"
+  OFFLINE_DOCKER_VERSION="$latest"
+  info "解析到 Docker latest：$OFFLINE_DOCKER_VERSION"
+}
+offline_resolve_latest_docker_local() {
+  local latest=""
+  if [[ -d "$OFFLINE_RESOURCE_DIR" ]]; then
+    latest="$(find "$OFFLINE_RESOURCE_DIR" -maxdepth 1 -type f -name 'docker-*.tgz' -printf '%f\n' 2>/dev/null \
+      | sed -E 's/^docker-//; s/\.tgz$//; s/-x86_64$//; s/-aarch64$//; s/-ce$//' \
+      | grep -E '^[0-9]+(\.[0-9]+)+' \
+      | sort -Vu \
+      | tail -n 1 || true)"
+  fi
+  [[ -n "$latest" ]] || return 1
+  OFFLINE_DOCKER_VERSION="$latest"
+  info "从本地资源解析到 Docker 最高版本：$OFFLINE_DOCKER_VERSION"
+}
+offline_resolve_latest_compose_online() { OFFLINE_COMPOSE_VERSION="latest"; }
+offline_resolve_latest_compose_local() {
+  local latest=""
+  if [[ -d "$OFFLINE_RESOURCE_DIR" ]]; then
+    latest="$(find "$OFFLINE_RESOURCE_DIR" -maxdepth 1 -type f \( -name 'docker-compose-*-linux-*' -o -name 'docker-compose-linux-*' \) -printf '%f\n' 2>/dev/null \
+      | sed -E 's/^docker-compose-//; s/-linux-(x86_64|aarch64)$//; s/^linux-(x86_64|aarch64)$/latest/' \
+      | grep -E '^latest$|^[0-9]+(\.[0-9]+)+' \
+      | sort -Vu \
+      | tail -n 1 || true)"
+  fi
+  [[ -n "$latest" ]] || return 1
+  OFFLINE_COMPOSE_VERSION="$latest"
+  info "从本地资源解析到 Compose 版本：$OFFLINE_COMPOSE_VERSION"
+}
+offline_docker_url() { offline_replace_placeholders "$OFFLINE_DOCKER_URL_TEMPLATE"; }
+offline_compose_url() {
+  if [[ "$OFFLINE_COMPOSE_VERSION" == "latest" ]]; then
+    offline_replace_compose_placeholders "$OFFLINE_COMPOSE_LATEST_URL_TEMPLATE"
+  else
+    offline_replace_compose_placeholders "$OFFLINE_COMPOSE_URL_TEMPLATE"
+  fi
+}
+offline_docker_resource_path() { printf '%s/docker-%s-%s.tgz' "$OFFLINE_RESOURCE_DIR" "$OFFLINE_DOCKER_VERSION" "$OFFLINE_DOCKER_ARCH"; }
+offline_compose_resource_path() {
+  if [[ "$OFFLINE_COMPOSE_VERSION" == "latest" ]]; then
+    printf '%s/docker-compose-linux-%s' "$OFFLINE_RESOURCE_DIR" "$OFFLINE_COMPOSE_ARCH"
+  else
+    printf '%s/docker-compose-%s-linux-%s' "$OFFLINE_RESOURCE_DIR" "$OFFLINE_COMPOSE_VERSION" "$OFFLINE_COMPOSE_ARCH"
+  fi
+}
+offline_find_docker_resource() {
+  local p
+  if [[ "$OFFLINE_DOCKER_VERSION" == "latest" ]]; then offline_resolve_latest_docker_local || true; fi
+  local candidates=(
+    "$OFFLINE_RESOURCE_DIR/docker-${OFFLINE_DOCKER_VERSION}-${OFFLINE_DOCKER_ARCH}.tgz"
+    "$OFFLINE_RESOURCE_DIR/docker-${OFFLINE_DOCKER_VERSION}.tgz"
+    "$OFFLINE_RESOURCE_DIR/docker-${OFFLINE_DOCKER_VERSION}-ce-${OFFLINE_DOCKER_ARCH}.tgz"
+    "$OFFLINE_RESOURCE_DIR/docker-${OFFLINE_DOCKER_VERSION}-ce.tgz"
+  )
+  for p in "${candidates[@]}"; do [[ -f "$p" ]] && { printf '%s' "$p"; return 0; }; done
+  return 1
+}
+offline_find_compose_resource() {
+  local p
+  if [[ "$OFFLINE_COMPOSE_VERSION" == "latest" ]]; then offline_resolve_latest_compose_local || true; fi
+  local candidates=(
+    "$OFFLINE_RESOURCE_DIR/docker-compose-${OFFLINE_COMPOSE_VERSION}-linux-${OFFLINE_COMPOSE_ARCH}"
+    "$OFFLINE_RESOURCE_DIR/docker-compose-linux-${OFFLINE_COMPOSE_ARCH}"
+    "$OFFLINE_RESOURCE_DIR/docker-compose"
+  )
+  for p in "${candidates[@]}"; do [[ -f "$p" ]] && { printf '%s' "$p"; return 0; }; done
+  return 1
+}
+offline_ensure_resource_or_download() {
+  local kind="$1" found=0
+  if [[ "$kind" == "docker" ]]; then offline_find_docker_resource >/dev/null && found=1; else offline_find_compose_resource >/dev/null && found=1; fi
+  [[ "$found" -eq 1 ]] && return 0
+  if [[ "$OFFLINE_DOWNLOAD_IF_MISSING" -eq 1 ]]; then
+    info "$kind 资源不存在，自动下载。"
+    if [[ "$kind" == "docker" ]]; then
+      local old="$OFFLINE_SKIP_COMPOSE"; OFFLINE_SKIP_COMPOSE=1; offline_action_download; OFFLINE_SKIP_COMPOSE="$old"
+    else
+      local old="$OFFLINE_SKIP_DOCKER"; OFFLINE_SKIP_DOCKER=1; offline_action_download; OFFLINE_SKIP_DOCKER="$old"
+    fi
+    return 0
+  fi
+  fatal "$kind 资源不存在。请先执行 download 或添加 --download-if-missing。资源目录：$OFFLINE_RESOURCE_DIR"
+}
+offline_ensure_state() { run mkdir -p "$OFFLINE_STATE_DIR"; touch "$OFFLINE_MANIFEST_FILE" "$OFFLINE_BACKUP_MANIFEST_FILE"; }
+offline_path_in_manifest() { local path="$1"; [[ -f "$OFFLINE_MANIFEST_FILE" ]] && grep -Fxq "$path" "$OFFLINE_MANIFEST_FILE"; }
+offline_add_manifest() { local path="$1"; grep -Fxq "$path" "$OFFLINE_MANIFEST_FILE" 2>/dev/null || printf '%s\n' "$path" >> "$OFFLINE_MANIFEST_FILE"; }
+offline_backup_existing_if_needed() {
+  local target="$1" encoded backup_path
+  [[ -e "$target" || -L "$target" ]] || return 0
+  offline_path_in_manifest "$target" && return 0
+  encoded="$(printf '%s' "$target" | sed 's#/#__#g')"
+  backup_path="$OFFLINE_STATE_DIR/backups/$encoded"
+  run mkdir -p "$(dirname "$backup_path")"
+  if [[ -L "$target" ]]; then cp -P "$target" "$backup_path"; else cp -a "$target" "$backup_path"; fi
+  printf '%s|%s\n' "$target" "$backup_path" >> "$OFFLINE_BACKUP_MANIFEST_FILE"
+  warn "发现已有文件，已备份：$target -> $backup_path"
+}
+offline_install_file_managed() {
+  local src="$1" target="$2" mode="${3:-0755}"
+  offline_ensure_state
+  offline_backup_existing_if_needed "$target"
+  run mkdir -p "$(dirname "$target")"
+  run install -m "$mode" "$src" "$target"
+  offline_add_manifest "$target"
+}
+offline_install_symlink_managed() {
+  local link_target="$1" link_path="$2"
+  offline_ensure_state
+  offline_backup_existing_if_needed "$link_path"
+  run mkdir -p "$(dirname "$link_path")"
+  run ln -sfn "$link_target" "$link_path"
+  offline_add_manifest "$link_path"
+}
+offline_write_text_managed() {
+  local target="$1" mode="$2"
+  offline_ensure_state
+  offline_backup_existing_if_needed "$target"
+  run mkdir -p "$(dirname "$target")"
+  if [[ "$DRY_RUN" -eq 1 ]]; then info "+ write file $target"; cat >/dev/null; else cat > "$target"; fi
+  [[ "$DRY_RUN" -eq 1 ]] || chmod "$mode" "$target"
+  offline_add_manifest "$target"
+}
+offline_create_daemon_json_if_missing() {
+  local target="/etc/docker/daemon.json"
+  if [[ -f "$target" ]]; then info "已存在 $target，保持不覆盖。"; return 0; fi
+  run mkdir -p /etc/docker
+  local tmp; tmp="$(mktemp)"
+  {
+    printf '{\n'
+    printf '  "log-driver": "json-file",\n'
+    printf '  "log-opts": {"max-size": "100m", "max-file": "3"}'
+    [[ -n "$OFFLINE_DATA_ROOT" ]] && printf ',\n  "data-root": "%s"' "$OFFLINE_DATA_ROOT"
+    [[ -n "$OFFLINE_REGISTRY_MIRROR" ]] && printf ',\n  "registry-mirrors": ["%s"]' "$OFFLINE_REGISTRY_MIRROR"
+    printf '\n}\n'
+  } > "$tmp"
+  offline_install_file_managed "$tmp" "$target" 0644
+  run rm -f "$tmp"
+  info "已创建默认 Docker 配置：$target"
+}
+offline_create_systemd_service() {
+  if ! has_cmd systemctl; then return 0; fi
+  local tmp; tmp="$(mktemp)"
+  cat > "$tmp" <<'SERVICE'
+[Unit]
+Description=Docker Application Container Engine
+Documentation=https://docs.docker.com
+After=network-online.target firewalld.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/dockerd --host=unix:///var/run/docker.sock
+ExecReload=/bin/kill -s HUP $MAINPID
+TimeoutStartSec=0
+Restart=always
+RestartSec=2
+Delegate=yes
+KillMode=process
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+  offline_install_file_managed "$tmp" "/etc/systemd/system/docker.service" 0644
+  run rm -f "$tmp"
+  has_cmd systemctl && run systemctl daemon-reload
+}
+offline_install_docker_binaries() {
+  ensure_linux_only "macOS 不支持 Docker 离线二进制安装。"
+  offline_ensure_resource_or_download docker
+  local tgz tmpdir f base
+  tgz="$(offline_find_docker_resource)"
+  info "安装 Docker Engine：$tgz"
+  tmpdir="$(mktemp -d)"
+  run tar -xzf "$tgz" -C "$tmpdir"
+  [[ -d "$tmpdir/docker" ]] || fatal "Docker 压缩包格式异常，未找到 docker/ 目录。"
+  for f in "$tmpdir/docker"/*; do
+    [[ -f "$f" ]] || continue
+    base="$(basename "$f")"
+    offline_install_file_managed "$f" "/usr/local/bin/$base" 0755
+  done
+  run rm -rf "$tmpdir"
+  if has_cmd groupadd; then groupadd -f docker || warn "创建 docker 用户组失败，可手工检查。"; fi
+  offline_create_daemon_json_if_missing
+  offline_create_systemd_service
+  if has_cmd systemctl; then
+    [[ "$OFFLINE_ENABLE_SERVICE" -eq 0 ]] || { run systemctl enable docker.service || warn "设置 docker 开机自启失败。"; }
+    [[ "$OFFLINE_START_SERVICE" -eq 0 ]] || { run systemctl restart docker.service || warn "docker 服务启动失败，请执行：journalctl -u docker -xe。"; }
+  fi
+}
+offline_install_compose_binary() {
+  ensure_linux_only "macOS 不支持 Compose 离线二进制安装。"
+  offline_ensure_resource_or_download compose
+  local src plugin_dir plugin_path
+  src="$(offline_find_compose_resource)"
+  plugin_dir="/usr/local/lib/docker/cli-plugins"
+  plugin_path="$plugin_dir/docker-compose"
+  info "安装 Docker Compose：$src"
+  offline_install_file_managed "$src" "$plugin_path" 0755
+  offline_install_symlink_managed "$plugin_path" "/usr/local/bin/docker-compose"
+}
+offline_action_download() {
+  offline_detect_arch
+  run mkdir -p "$OFFLINE_RESOURCE_DIR"
+  if [[ "$OFFLINE_SKIP_DOCKER" -eq 0 ]]; then
+    [[ "$OFFLINE_DOCKER_VERSION" == "latest" ]] && offline_resolve_latest_docker_online
+    local docker_out; docker_out="$(offline_docker_resource_path)"
+    if [[ -f "$docker_out" ]]; then info "Docker 资源已存在，跳过：$docker_out"
+    else offline_download_file "$(offline_docker_url)" "$docker_out"; fi
+  fi
+  if [[ "$OFFLINE_SKIP_COMPOSE" -eq 0 ]]; then
+    [[ "$OFFLINE_COMPOSE_VERSION" == "latest" ]] && offline_resolve_latest_compose_online
+    local compose_out; compose_out="$(offline_compose_resource_path)"
+    if [[ -f "$compose_out" ]]; then info "Compose 资源已存在，跳过：$compose_out"
+    else offline_download_file "$(offline_compose_url)" "$compose_out"; run chmod +x "$compose_out"; fi
+  fi
+  info "资源准备完成：$OFFLINE_RESOURCE_DIR"
+}
+offline_action_install() {
+  ensure_linux_only "macOS 不支持 Docker 离线二进制安装，请使用 docker install。"
+  local missing=()
+  for c in tar iptables modprobe; do has_cmd "$c" || missing+=("$c"); done
+  if (( ${#missing[@]} > 0 )); then warn "缺少可能影响 Docker 运行的系统命令：${missing[*]}。"; fi
+  if has_cmd systemctl; then :; else warn "当前系统未检测到 systemctl，不能自动创建/启动 systemd 服务。"; fi
+  offline_detect_arch
+  [[ "$OFFLINE_SKIP_DOCKER" -eq 1 ]] || offline_install_docker_binaries
+  [[ "$OFFLINE_SKIP_COMPOSE" -eq 1 ]] || offline_install_compose_binary
+  info "离线安装完成。"
+  offline_action_status || true
+  cat <<'TIP'
+提示：
+  - Docker Compose v2 推荐命令：docker compose version
+  - 兼容老习惯命令：docker-compose version
+  - 非 root 用户使用 docker：sudo usermod -aG docker <用户名>，然后重新登录
+TIP
+}
+offline_restore_backups() {
+  [[ -f "$OFFLINE_BACKUP_MANIFEST_FILE" ]] || return 0
+  tac "$OFFLINE_BACKUP_MANIFEST_FILE" 2>/dev/null | while IFS='|' read -r target backup_path; do
+    [[ -n "${target:-}" && -n "${backup_path:-}" ]] || continue
+    [[ -e "$backup_path" || -L "$backup_path" ]] || continue
+    run mkdir -p "$(dirname "$target")"
+    run rm -rf "$target"
+    if [[ -L "$backup_path" ]]; then cp -P "$backup_path" "$target"; else cp -a "$backup_path" "$target"; fi
+    info "已恢复原有文件：$target"
+  done
+}
+offline_action_uninstall() {
+  if [[ "$OFFLINE_PURGE_DATA" -eq 1 ]]; then confirm "即将删除 Docker 程序和数据目录，确认继续？" || cancelled; fi
+  has_cmd systemctl && { run systemctl stop docker.service 2>/dev/null || true; run systemctl disable docker.service 2>/dev/null || true; }
+  if [[ -f "$OFFLINE_MANIFEST_FILE" ]]; then
+    tac "$OFFLINE_MANIFEST_FILE" 2>/dev/null | while read -r path; do
+      [[ -n "$path" ]] || continue
+      [[ -e "$path" || -L "$path" ]] && { run rm -rf "$path"; info "已删除：$path"; }
+    done
+  else warn "未找到安装清单，不盲目删除系统文件。"; fi
+  offline_restore_backups
+  has_cmd systemctl && run systemctl daemon-reload || true
+  if [[ "$OFFLINE_PURGE_DATA" -eq 1 ]]; then
+    confirm "确认删除 /var/lib/docker /var/lib/containerd /etc/docker？" && run rm -rf /var/lib/docker /var/lib/containerd /etc/docker
+  else info "已保留 Docker 数据目录。"; fi
+  run rm -rf "$OFFLINE_STATE_DIR"
+  info "卸载完成。"
+}
+offline_action_status() {
+  echo; info "==== Docker 状态 ===="
+  has_cmd docker && run docker --version || echo "docker 命令：未安装或不在 PATH"
+  has_cmd docker && run docker compose version 2>/dev/null || true
+  has_cmd docker-compose && run docker-compose version 2>/dev/null || true
+  if has_cmd systemctl; then run systemctl --no-pager --full status docker.service 2>/dev/null | head -12 || true; fi
+  echo
+}
+offline_action_package() {
+  offline_detect_arch
+  offline_action_download
+  local pkg_base staging out
+  pkg_base="docker-offline-${OFFLINE_DOCKER_VERSION}-compose-${OFFLINE_COMPOSE_VERSION}-${OFFLINE_DOCKER_ARCH}"
+  out="${OFFLINE_PACKAGE_FILE:-${pkg_base}.tar.gz}"
+  staging="$(mktemp -d)"
+  run mkdir -p "$staging/$pkg_base/resources"
+  # 生成独立离线安装脚本
+  cat > "$staging/$pkg_base/install-docker-offline.sh" <<'OFFLINE_SCRIPT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+STATE_DIR="/var/lib/docker-offline-installer"
+MANIFEST_FILE="$STATE_DIR/manifest"
+BACKUP_MANIFEST_FILE="$STATE_DIR/backup-manifest"
+RESOURCE_DIR="${1:-./resources}"
+log()  { printf '\033[1;32m[INFO]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31m[ERR ]\033[0m %s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+need_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "需要 root 权限。"; }
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+confirm_or_die() { local msg="$1" ans; read -r -p "$msg [y/N]: " ans; [[ "$ans" == "y" || "$ans" == "Y" ]] || die "用户取消。"; }
+# 对离线包使用场景，运行时传入资源目录即可
+if [[ "${1:-}" == "install" ]]; then
+  need_root
+  RESOURCE_DIR="${2:-./resources}"
+  [[ -d "$RESOURCE_DIR" ]] || die "资源目录不存在：$RESOURCE_DIR"
+  # 安装 Docker
+  local tgz tmpdir f base
+  tgz="$(find "$RESOURCE_DIR" -maxdepth 1 -name 'docker-*.tgz' | head -1)"
+  [[ -f "$tgz" ]] || die "未找到 Docker 资源包"
+  log "安装 Docker Engine：$tgz"
+  tmpdir="$(mktemp -d)"; tar -xzf "$tgz" -C "$tmpdir"
+  for f in "$tmpdir/docker"/*; do [[ -f "$f" ]] && install -m 0755 "$f" "/usr/local/bin/$(basename "$f")"; done
+  rm -rf "$tmpdir"
+  # 安装 Compose
+  local src="$(find "$RESOURCE_DIR" -maxdepth 1 \( -name 'docker-compose-*' -o -name 'docker-compose-linux-*' \) | head -1)"
+  if [[ -f "$src" ]]; then
+    log "安装 Docker Compose：$src"
+    mkdir -p /usr/local/lib/docker/cli-plugins
+    install -m 0755 "$src" /usr/local/lib/docker/cli-plugins/docker-compose
+    ln -sfn /usr/local/lib/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose
+  fi
+  # systemd
+  if has_cmd systemctl; then
+    cat > /etc/systemd/system/docker.service <<'UNIT'
+[Unit]
+Description=Docker Application Container Engine
+After=network-online.target firewalld.service
+Wants=network-online.target
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/dockerd --host=unix:///var/run/docker.sock
+ExecReload=/bin/kill -s HUP $MAINPID
+TimeoutStartSec=0
+Restart=always
+RestartSec=2
+Delegate=yes
+KillMode=process
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload; systemctl enable --now docker.service
+  fi
+  log "安装完成。"
+elif [[ "${1:-}" == "uninstall" ]]; then
+  need_root
+  has_cmd systemctl && { systemctl stop docker.service 2>/dev/null || true; systemctl disable docker.service 2>/dev/null || true; }
+  rm -f /usr/local/bin/docker /usr/local/bin/dockerd /usr/local/bin/docker-init /usr/local/bin/docker-proxy /usr/local/bin/containerd /usr/local/bin/containerd-shim-runc-v2 /usr/local/bin/ctr /usr/local/bin/runc
+  rm -f /usr/local/bin/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
+  rm -f /etc/systemd/system/docker.service; has_cmd systemctl && systemctl daemon-reload || true
+  [[ "${2:-}" == "--purge-data" ]] && { confirm_or_die "确认删除 /var/lib/docker /var/lib/containerd /etc/docker？"; rm -rf /var/lib/docker /var/lib/containerd /etc/docker; }
+  log "卸载完成。"
+else
+  echo "用法：sudo ./install-docker-offline.sh install ./resources"
+  echo "      sudo ./install-docker-offline.sh uninstall [--purge-data]"
+fi
+OFFLINE_SCRIPT
+  run chmod +x "$staging/$pkg_base/install-docker-offline.sh"
+  [[ "$OFFLINE_SKIP_DOCKER" -eq 1 ]] || run cp "$(offline_find_docker_resource)" "$staging/$pkg_base/resources/"
+  [[ "$OFFLINE_SKIP_COMPOSE" -eq 1 ]] || run cp "$(offline_find_compose_resource)" "$staging/$pkg_base/resources/"
+  cat > "$staging/$pkg_base/README.txt" <<EOF_README
+Docker 离线二进制安装包
+离线安装：sudo ./install-docker-offline.sh install ./resources
+卸载：    sudo ./install-docker-offline.sh uninstall
+彻底卸载：sudo ./install-docker-offline.sh uninstall --purge-data
+版本：Docker Engine $OFFLINE_DOCKER_VERSION / Compose $OFFLINE_COMPOSE_VERSION / 架构 $OFFLINE_DOCKER_ARCH
+EOF_README
+  run tar -czf "$out" -C "$staging" "$pkg_base"
+  run rm -rf "$staging"
+  info "离线包已生成：$out"
+}
+offline_parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --resource-dir) OFFLINE_RESOURCE_DIR="$2"; shift 2 ;;
+      --docker-version) OFFLINE_DOCKER_VERSION="${2#v}"; shift 2 ;;
+      --compose-version) OFFLINE_COMPOSE_VERSION="${2#v}"; shift 2 ;;
+      --arch) OFFLINE_ARCH_OVERRIDE="$2"; shift 2 ;;
+      --download-if-missing) OFFLINE_DOWNLOAD_IF_MISSING=1; shift ;;
+      --skip-docker) OFFLINE_SKIP_DOCKER=1; shift ;;
+      --skip-compose) OFFLINE_SKIP_COMPOSE=1; shift ;;
+      --no-start) OFFLINE_START_SERVICE=0; shift ;;
+      --no-enable) OFFLINE_ENABLE_SERVICE=0; shift ;;
+      --data-root) OFFLINE_DATA_ROOT="$2"; shift 2 ;;
+      --registry-mirror) OFFLINE_REGISTRY_MIRROR="$2"; shift 2 ;;
+      --docker-channel) OFFLINE_DOCKER_CHANNEL="$2"; shift 2 ;;
+      --docker-url-template) OFFLINE_DOCKER_URL_TEMPLATE="$2"; shift 2 ;;
+      --compose-url-template) OFFLINE_COMPOSE_URL_TEMPLATE="$2"; shift 2 ;;
+      --compose-latest-url-template) OFFLINE_COMPOSE_LATEST_URL_TEMPLATE="$2"; shift 2 ;;
+      --package-file) OFFLINE_PACKAGE_FILE="$2"; shift 2 ;;
+      --purge-data) OFFLINE_PURGE_DATA=1; shift ;;
+      *) fatal "docker-offline 未知参数：$1" ;;
+    esac
+  done
+  run mkdir -p "$OFFLINE_RESOURCE_DIR" 2>/dev/null || true
+  OFFLINE_RESOURCE_DIR="$(cd "$OFFLINE_RESOURCE_DIR" 2>/dev/null && pwd || printf '%s' "$OFFLINE_RESOURCE_DIR")"
+}
 
 # ---------- 防火墙 / Swap / LVM / 性能 ----------
 is_firewalld_port_rule() { [[ "${1:-}" =~ ^[0-9]+(-[0-9]+)?/(tcp|udp|sctp|dccp)$ ]]; }
@@ -298,7 +768,7 @@ perf_quick() { ensure_perf_tools; echo "========== 系统信息 =========="; pri
 # ---------- 菜单 ----------
 menu_clear() { [[ -t 1 ]] && clear || true; }
 menu_invalid() { warn "无效选择，请重新输入。"; sleep 1; }
-menu_action() { local title="$1" rc; shift; echo; info "开始执行：${title}"; set +e; ( set -Eeuo pipefail; "$@" ); rc=$?; set -e; if [[ "$rc" -eq 0 ]]; then success "操作完成：${title}"; elif [[ "$rc" -eq "$SKIP_RC" ]]; then warn "操作已跳过：${title}"; elif [[ "$rc" -eq "$CANCEL_RC" ]]; then warn "操作已取消：${title}"; else warn "操作未完成或执行失败：${title}，退出码：${rc}"; fi; menu_pause; }
+menu_action() { local title="$1" rc; shift; echo; info "开始执行：${title}"; set +Eeuo pipefail; ( set -Eeuo pipefail; "$@" ); rc=$?; set -Eeuo pipefail; if [[ "$rc" -eq 0 ]]; then success "操作完成：${title}"; elif [[ "$rc" -eq "$SKIP_RC" ]]; then warn "操作已跳过：${title}"; elif [[ "$rc" -eq "$CANCEL_RC" ]]; then warn "操作已取消：${title}"; else warn "操作未完成或执行失败：${title}，退出码：${rc}"; fi; menu_pause; }
 menu_tools_config() { local c; while true; do menu_clear; cat <<'EOF_MENU'
 [常用工具配置]
 1) 查看常用工具安装状态
@@ -342,9 +812,20 @@ menu_docker() { local c; while true; do menu_clear; cat <<'EOF_MENU'
 3) 逐个导出本地镜像为 tar.gz
 4) 查看 Docker 状态
 5) 卸载 Docker
+6) 离线安装子菜单（下载/安装/打包/卸载）
 0) 返回上一级
 EOF_MENU
-read -r -p "选择: " c; case "${c:-}" in 1) menu_action "安装 Docker" menu_install_docker ;; 2) menu_action "配置 Docker Registry mirror" configure_docker_registry_mirror ;; 3) menu_action "逐个导出本地镜像为 tar.gz" save_docker_images_one_by_one ;; 4) menu_action "查看 Docker 状态" menu_docker_status ;; 5) menu_action "卸载 Docker" uninstall_docker 0 ;; 0) return ;; *) menu_invalid ;; esac; done; }
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "安装 Docker" menu_install_docker ;; 2) menu_action "配置 Docker Registry mirror" configure_docker_registry_mirror ;; 3) menu_action "逐个导出本地镜像为 tar.gz" save_docker_images_one_by_one ;; 4) menu_action "查看 Docker 状态" menu_docker_status ;; 5) menu_action "卸载 Docker" uninstall_docker 0 ;; 6) menu_docker_offline ;; 0) return ;; *) menu_invalid ;; esac; done; }
+menu_docker_offline() { local c; while true; do menu_clear; cat <<'EOF_MENU'
+[Docker 离线安装 - 二进制部署，无需网络/包管理器]
+1) 下载 Docker & Compose 二进制资源
+2) 从本地资源离线安装
+3) 打包成离线部署包（自包含 .tar.gz）
+4) 卸载（从离线安装的 Docker）
+5) 查看状态
+0) 返回上一级
+EOF_MENU
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "下载离线资源" offline_action_download ;; 2) menu_action "离线安装 Docker" offline_action_install ;; 3) menu_action "打包离线部署包" offline_action_package ;; 4) menu_action "卸载离线安装的 Docker" offline_action_uninstall ;; 5) menu_action "查看 Docker 状态" offline_action_status ;; 0) return ;; *) menu_invalid ;; esac; done; }
 menu_firewall() { local c; while true; do menu_clear; echo "[防火墙] 当前优先：$(preferred_firewall)"; cat <<'EOF_MENU'
 1) 安装防火墙
 2) 查看状态
@@ -418,6 +899,10 @@ usage() { cat <<EOF_USAGE
   $PROGRAM_NAME mirror set --source tuna
   $PROGRAM_NAME docker install --source tuna
   $PROGRAM_NAME docker mirror --registry https://registry.example.com
+  $PROGRAM_NAME docker-offline download --docker-version 28.5.1
+  $PROGRAM_NAME docker-offline install --resource-dir ./resources
+  $PROGRAM_NAME docker-offline package --package-file docker-offline.tar.gz
+  $PROGRAM_NAME docker-offline uninstall
   $PROGRAM_NAME firewall status
   $PROGRAM_NAME swap add --size 4G --path /swapfile
   $PROGRAM_NAME lvm list
@@ -425,5 +910,28 @@ usage() { cat <<EOF_USAGE
 EOF_USAGE
 }
 get_opt_value() { local key="$1" arg next; shift || true; while [[ "$#" -gt 0 ]]; do arg="$1"; case "$arg" in "$key") shift || true; next="${1:-}"; [[ -n "$next" ]] || return 1; printf '%s' "$next"; return 0 ;; "$key"=*) printf '%s' "${arg#*=}"; return 0 ;; esac; shift || true; done; return 1; }
-main() { detect_os; while [[ "$#" -gt 0 ]]; do case "${1:-}" in -y|--yes) ASSUME_YES=1; shift ;; -n|--dry-run) DRY_RUN=1; shift ;; --no-color) NO_COLOR=1; shift ;; -h|--help) usage; exit 0 ;; *) break ;; esac; done; local module="${1:-menu}" action="${2:-}"; case "$module" in menu|"") require_root "$@"; main_menu ;; env) print_env ;; tools) require_root "$@"; case "${action:-}" in install) install_common_tools ;; status) tool_status ;; config) case "${3:-all}" in all) configure_common_tools ;; vim) configure_vim ;; tmux) configure_tmux ;; git) configure_git ;; zsh-basic) configure_zsh_basic ;; *) fatal "未知 tools config 动作：${3:-}" ;; esac ;; oh-my-zsh) install_oh_my_zsh "$(get_opt_value --github-proxy "$@" || true)" ;; zsh-plugins) install_zsh_plugins "$(get_opt_value --github-proxy "$@" || true)" ;; install-z) install_rupa_z "$(get_opt_value --github-proxy "$@" || true)" ;; zsh-full) configure_zsh_full ;; chsh-zsh) change_default_shell_to_zsh ;; *) fatal "未知 tools 动作：${action:-}" ;; esac ;; mirror) require_root "$@"; case "${action:-}" in backup) backup_sources ;; set) set_system_mirror "$(get_opt_value --source "$@" || printf '%s' "$DEFAULT_SOURCE")" ;; list-backups) list_source_backups ;; restore) restore_sources "${3:-}" ;; refresh) refresh_pkg_cache ;; *) fatal "未知 mirror 动作：${action:-}" ;; esac ;; docker) require_root "$@"; case "${action:-}" in install) install_docker "$(get_opt_value --source "$@" || printf '%s' "$DEFAULT_DOCKER_SOURCE")" ;; mirror) configure_docker_registry_mirror "$(get_opt_value --registry "$@" || true)" ;; save-images) save_docker_images_one_by_one "$(get_opt_value --dir "$@" || true)" ;; status) menu_docker_status ;; uninstall) uninstall_docker "$(get_opt_value --remove-data "$@" || printf '0')" ;; *) fatal "未知 docker 动作：${action:-}" ;; esac ;; firewall) require_root "$@"; case "${action:-}" in install) install_firewall ;; status) firewall_status ;; enable) firewall_enable ;; disable) firewall_disable ;; allow) firewall_allow "${3:-}" ;; deny) firewall_deny "${3:-}" ;; uninstall) uninstall_firewall ;; *) fatal "未知 firewall 动作：${action:-}" ;; esac ;; swap) require_root "$@"; case "${action:-}" in list) swap_list ;; add) swap_add "$(get_opt_value --size "$@" || true)" "$(get_opt_value --path "$@" || printf '/swapfile')" ;; resize) swap_resize "$(get_opt_value --size "$@" || true)" "$(get_opt_value --path "$@" || printf '/swapfile')" ;; delete) swap_delete "$(get_opt_value --path "$@" || true)" ;; *) fatal "未知 swap 动作：${action:-}" ;; esac ;; lvm) require_root "$@"; case "${action:-}" in list) lvm_list ;; install) ensure_lvm ;; create-pv) lvm_create_pv "${3:-}" ;; create-vg) shift 2; lvm_create_vg "$@" ;; create-lv) lvm_create_lv "${3:-}" "${4:-}" "${5:-}" ;; extend-lv) lvm_extend_lv "${3:-}" "${4:-}" ;; remove-lv) lvm_remove_lv "${3:-}" ;; *) fatal "未知 lvm 动作：${action:-}" ;; esac ;; perf) case "${action:-quick}" in quick) perf_quick ;; install-tools) ensure_perf_tools ;; *) fatal "未知 perf 动作：${action:-}" ;; esac ;; *) usage; fatal "未知模块：${module}" ;; esac; }
+main() { detect_os; while [[ "$#" -gt 0 ]]; do case "${1:-}" in -y|--yes) ASSUME_YES=1; shift ;; -n|--dry-run) DRY_RUN=1; shift ;; --no-color) NO_COLOR=1; shift ;; -h|--help) usage; exit 0 ;; *) break ;; esac; done; local module="${1:-menu}" action="${2:-}"; case "$module" in menu|"") require_root "$@"; main_menu ;; env) print_env ;; tools) require_root "$@"; case "${action:-}" in install) install_common_tools ;; status) tool_status ;; config) case "${3:-all}" in all) configure_common_tools ;; vim) configure_vim ;; tmux) configure_tmux ;; git) configure_git ;; zsh-basic) configure_zsh_basic ;; *) fatal "未知 tools config 动作：${3:-}" ;; esac ;; oh-my-zsh) install_oh_my_zsh "$(get_opt_value --github-proxy "$@" || true)" ;; zsh-plugins) install_zsh_plugins "$(get_opt_value --github-proxy "$@" || true)" ;; install-z) install_rupa_z "$(get_opt_value --github-proxy "$@" || true)" ;; zsh-full) configure_zsh_full ;; chsh-zsh) change_default_shell_to_zsh ;; *) fatal "未知 tools 动作：${action:-}" ;; esac ;; mirror) require_root "$@"; case "${action:-}" in backup) backup_sources ;; set) set_system_mirror "$(get_opt_value --source "$@" || printf '%s' "$DEFAULT_SOURCE")" ;; list-backups) list_source_backups ;; restore) restore_sources "${3:-}" ;; refresh) refresh_pkg_cache ;; *) fatal "未知 mirror 动作：${action:-}" ;; esac ;; docker) require_root "$@"; case "${action:-}" in install) install_docker "$(get_opt_value --source "$@" || printf '%s' "$DEFAULT_DOCKER_SOURCE")" ;; mirror) configure_docker_registry_mirror "$(get_opt_value --registry "$@" || true)" ;; save-images) save_docker_images_one_by_one "$(get_opt_value --dir "$@" || true)" ;; status) menu_docker_status ;; uninstall) uninstall_docker "$(get_opt_value --remove-data "$@" || printf '0')" ;; *) fatal "未知 docker 动作：${action:-}" ;; esac ;; firewall) require_root "$@"; case "${action:-}" in install) install_firewall ;; status) firewall_status ;; enable) firewall_enable ;; disable) firewall_disable ;; allow) firewall_allow "${3:-}" ;; deny) firewall_deny "${3:-}" ;; uninstall) uninstall_firewall ;; *) fatal "未知 firewall 动作：${action:-}" ;; esac ;; swap) require_root "$@"; case "${action:-}" in list) swap_list ;; add) swap_add "$(get_opt_value --size "$@" || true)" "$(get_opt_value --path "$@" || printf '/swapfile')" ;; resize) swap_resize "$(get_opt_value --size "$@" || true)" "$(get_opt_value --path "$@" || printf '/swapfile')" ;; delete) swap_delete "$(get_opt_value --path "$@" || true)" ;; *) fatal "未知 swap 动作：${action:-}" ;; esac ;; lvm) require_root "$@"; case "${action:-}" in list) lvm_list ;; install) ensure_lvm ;; create-pv) lvm_create_pv "${3:-}" ;; create-vg) shift 2; lvm_create_vg "$@" ;; create-lv) lvm_create_lv "${3:-}" "${4:-}" "${5:-}" ;; extend-lv) lvm_extend_lv "${3:-}" "${4:-}" ;; remove-lv) lvm_remove_lv "${3:-}" ;; *) fatal "未知 lvm 动作：${action:-}" ;; esac ;; perf) case "${action:-quick}" in quick) perf_quick ;; install-tools) ensure_perf_tools ;; *) fatal "未知 perf 动作：${action:-}" ;; esac ;; docker-offline) require_root "$@"; shift 2; case "${action:-}" in help) cat <<'EOF_OFFLINE_HELP'
+docker-offline 模块：离线二进制安装 Docker Engine + Docker Compose
+
+动作：
+  download   下载 Docker/Compose 二进制到资源目录
+  install    从本地资源离线安装
+  package    下载并打包成自包含 .tar.gz 离线部署包
+  uninstall  卸载通过离线方式安装的 Docker
+  status     查看当前 Docker 运行状态
+
+选项：
+  --resource-dir DIR       资源目录，默认 ./resources
+  --docker-version VER     Docker 版本，默认 latest
+  --compose-version VER    Compose 版本，默认 latest
+  --arch ARCH              架构：x86_64 / aarch64
+  --download-if-missing    install 时资源缺失则自动下载
+  --skip-docker / --skip-compose  跳过 Docker/Compose
+  --no-start / --no-enable  不启动/不开机自启
+  --data-root DIR          设置 Docker data-root
+  --registry-mirror URL    设置 registry mirror
+  --package-file FILE      package 输出文件名
+  --purge-data             uninstall 时同时删除数据
+EOF_OFFLINE_HELP
+;; status) offline_action_status ;; *) offline_parse_args "$@"; case "${action:-}" in download) offline_action_download ;; install) offline_action_install ;; package) offline_action_package ;; uninstall) offline_action_uninstall ;; *) fatal "未知 docker-offline 动作：${action:-}。支持：download/install/package/uninstall/status/help" ;; esac ;; esac ;; *) usage; fatal "未知模块：${module}" ;; esac; }
 main "$@"

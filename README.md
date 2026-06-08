@@ -9,7 +9,8 @@
 | 脚本 | 用途 | 状态 |
 | --- | --- | --- |
 | [`sshm.sh`](./sshm.sh) | SSH 主机管理脚本，支持保存主机、按别名或 ID 连接、增删改查、搜索和备注。 | 可用 |
-| [`linux-admin-toolkit.sh`](./linux-admin-toolkit.sh) | Linux/macOS 运维工具箱，覆盖常用工具安装、软件源、Docker、防火墙、Swap/LVM 和性能排查。 | 可用 |
+| [`linux-admin-toolkit.sh`](./linux-admin-toolkit.sh) | Linux/macOS 运维工具箱，覆盖常用工具安装、软件源、Docker、防火墙、Swap/LVM 和性能排查。内含 `docker-offline` 模块支持离线二进制安装。 | 可用 |
+| [`install-docker-offline.sh`](./install-docker-offline.sh) | Docker 离线二进制独立安装脚本（功能已合并到 toolkit）；支持下载/安装/卸载/打包。 | 可用 |
 
 ## 快速开始
 
@@ -112,6 +113,32 @@ alias,user,host,port,identity,note
 -n, --dry-run   只打印不执行
 --no-color      禁用颜色
 ```
+
+### Docker 离线安装模块
+
+`docker-offline` 模块支持在无网络环境中安装 Docker（二进制部署，不依赖包管理器）：
+
+```bash
+# 联网机器：下载指定版本 Docker & Compose 二进制
+./linux-admin-toolkit.sh docker-offline download --docker-version 28.5.1 --compose-version 2.40.3
+
+# 联网机器：直接制作离线部署包
+./linux-admin-toolkit.sh docker-offline package --docker-version 28.5.1 --compose-version 2.40.3
+
+# 离线机器：从本地资源安装
+./linux-admin-toolkit.sh docker-offline install --resource-dir ./resources
+
+# 离线机器：卸载
+./linux-admin-toolkit.sh docker-offline uninstall
+
+# 彻底卸载（含数据）
+./linux-admin-toolkit.sh docker-offline uninstall --purge-data -y
+
+# 查看状态
+./linux-admin-toolkit.sh docker-offline status
+```
+
+离线安装模块支持的选项：`--resource-dir`、`--docker-version`、`--compose-version`、`--arch`、`--download-if-missing`、`--skip-docker`、`--skip-compose`、`--no-start`、`--no-enable`、`--data-root`、`--registry-mirror`、`--docker-channel`、`--package-file`、`--purge-data`。
 
 ## 兼容性
 
