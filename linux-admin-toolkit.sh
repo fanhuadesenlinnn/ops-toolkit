@@ -9,12 +9,14 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 PROGRAM_NAME="$(basename "$0")"
-TOOL_VERSION="0.3.4"
+TOOL_VERSION="0.4.0"
 ASSUME_YES=0
 DRY_RUN=0
 NO_COLOR=0
 PKG_UPDATED=0
 BACKUP_ROOT="/var/backups/linux-admin-toolkit"
+AUDIT_LOG="${LINUX_ADMIN_AUDIT_LOG:-/var/log/linux-admin-toolkit.log}"
+CONFIG_FILE="${LINUX_ADMIN_CONFIG:-$HOME/.config/ops-toolkit/config}"
 CANCEL_RC=130
 SKIP_RC=100
 DEFAULT_SOURCE="${LINUX_ADMIN_SOURCE:-official}"
@@ -35,6 +37,8 @@ OFFLINE_PURGE_DATA=0
 OFFLINE_PACKAGE_FILE=""
 OFFLINE_DATA_ROOT=""
 OFFLINE_REGISTRY_MIRROR=""
+OFFLINE_START_SERVICE=1
+OFFLINE_ENABLE_SERVICE=1
 OFFLINE_DOCKER_URL_TEMPLATE="https://download.docker.com/linux/static/{channel}/{arch}/docker-{version}.tgz"
 OFFLINE_COMPOSE_URL_TEMPLATE="https://github.com/docker/compose/releases/download/v{version}/docker-compose-linux-{arch}"
 OFFLINE_COMPOSE_LATEST_URL_TEMPLATE="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-{arch}"
@@ -52,7 +56,8 @@ error() { _color "1;31" "[ERROR] $*" >&2; }
 fatal() { error "$*"; exit 1; }
 
 format_cmd() { local arg quoted out=""; for arg in "$@"; do printf -v quoted '%q' "$arg"; out="${out}${out:+ }${quoted}"; done; printf '%s' "$out"; }
-run() { info "+ $(format_cmd "$@")"; [[ "$DRY_RUN" -eq 1 ]] && return 0; "$@"; }
+audit_log() { local ts; ts="$(date '+%Y-%m-%d %H:%M:%S')"; { mkdir -p "$(dirname "$AUDIT_LOG")" 2>/dev/null && printf '[%s] %s\n' "$ts" "$*" >> "$AUDIT_LOG"; } 2>/dev/null || true; }
+run() { info "+ $(format_cmd "$@")"; audit_log "RUN: $(format_cmd "$@")"; [[ "$DRY_RUN" -eq 1 ]] && return 0; "$@"; }
 run_shell() { info "+ $*"; [[ "$DRY_RUN" -eq 1 ]] && return 0; bash -Eeuo pipefail -c "$*"; }
 cmd_path() { local cmd="${1:-}" d; [[ -n "$cmd" ]] || return 1; command -v "$cmd" 2>/dev/null && return 0; for d in /opt/homebrew/bin /opt/homebrew/sbin /usr/local/bin /usr/local/sbin /usr/bin /bin /usr/sbin /sbin; do [[ -x "$d/$cmd" ]] && { printf '%s\n' "$d/$cmd"; return 0; }; done; return 1; }
 has_cmd() { cmd_path "${1:-}" >/dev/null 2>&1; }
@@ -68,6 +73,22 @@ write_file() { local file="$1" dir; dir="$(dirname "$file")"; if [[ "$DRY_RUN" -
 append_file() { local file="$1" dir; dir="$(dirname "$file")"; if [[ "$DRY_RUN" -eq 1 ]]; then info "+ append file $file"; cat >/dev/null; return 0; fi; mkdir -p "$dir"; cat >> "$file"; }
 append_line_if_missing() { local file="$1" line="$2" dir; dir="$(dirname "$file")"; [[ "$DRY_RUN" -eq 1 ]] && { info "+ append line to $file if missing: $line"; return 0; }; mkdir -p "$dir"; touch "$file"; grep -qxF "$line" "$file" 2>/dev/null || printf '%s\n' "$line" >> "$file"; }
 backup_file_if_exists() { local file="$1"; [[ -e "$file" ]] || return 0; run cp -a "$file" "$file.bak.$(date +%Y%m%d-%H%M%S)"; }
+
+# ---------- 配置文件 ----------
+load_config() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  while IFS='=' read -r key value; do
+    key="$(trim_string "${key:-}")"
+    [[ -z "$key" || "$key" == \#* ]] && continue
+    value="$(trim_string "${value:-}")"
+    case "$key" in
+      DEFAULT_SOURCE) DEFAULT_SOURCE="$value" ;;
+      DEFAULT_DOCKER_SOURCE) DEFAULT_DOCKER_SOURCE="$value" ;;
+      GITHUB_PROXY_PREFIX) GITHUB_PROXY_PREFIX="$value" ;;
+      AUDIT_LOG) AUDIT_LOG="$value" ;;
+    esac
+  done < "$CONFIG_FILE"
+}
 
 # ---------- 系统检测 ----------
 detect_os() {
@@ -765,6 +786,30 @@ lvm_remove_lv() { ensure_lvm; local lv="${1:-}"; [[ -n "$lv" ]] || { lvs; read -
 ensure_perf_tools() { is_macos && { has_cmd htop || brew_install htop || true; return 0; }; case "$PKG_MANAGER" in apt) pkg_install sysstat htop lsof iotop iftop nload iproute2 procps ;; dnf|yum) pkg_install sysstat htop lsof iotop iftop nload iproute procps-ng ;; pacman) pkg_install sysstat htop lsof iotop iftop nload iproute2 procps-ng ;; *) warn "无法自动安装性能工具。" ;; esac; }
 perf_quick() { ensure_perf_tools; echo "========== 系统信息 =========="; print_env; echo; echo "========== 负载 =========="; uptime || true; echo; echo "========== 内存 =========="; free -h 2>/dev/null || vm_stat 2>/dev/null || true; echo; echo "========== 磁盘 =========="; df -hT 2>/dev/null || df -h || true; echo; echo "========== 网络 =========="; has_cmd ss && ss -s || netstat -ib 2>/dev/null | head -n 20 || true; echo; echo "========== Top 进程 =========="; ps aux --sort=-%cpu 2>/dev/null | head -n 10 || ps aux | head -n 10 || true; }
 
+# ---------- 服务管理 ----------
+svc_list() { ensure_linux_only "macOS 使用 launchctl 管理服务。"; has_cmd systemctl && run systemctl list-units --type=service --state=running || warn "未检测到 systemctl。"; }
+svc_status() { ensure_linux_only "macOS 使用 launchctl 管理服务。"; local svc="${1:-}"; [[ -n "$svc" ]] || read -r -p "服务名: " svc; has_cmd systemctl && run systemctl status "$svc" || warn "未检测到 systemctl。"; }
+svc_restart() { ensure_linux_only "macOS 使用 launchctl 管理服务。"; local svc="${1:-}"; [[ -n "$svc" ]] || read -r -p "服务名: " svc; confirm "即将重启服务 ${svc}。是否继续？" || cancelled; has_cmd systemctl && run systemctl restart "$svc" || warn "未检测到 systemctl。"; }
+svc_enable() { ensure_linux_only "macOS 使用 launchctl 管理服务。"; local svc="${1:-}"; [[ -n "$svc" ]] || read -r -p "服务名: " svc; has_cmd systemctl && run systemctl enable "$svc" || warn "未检测到 systemctl。"; }
+svc_disable() { ensure_linux_only "macOS 使用 launchctl 管理服务。"; local svc="${1:-}"; [[ -n "$svc" ]] || read -r -p "服务名: " svc; confirm "即将禁用服务 ${svc}。是否继续？" || cancelled; has_cmd systemctl && run systemctl disable --now "$svc" || warn "未检测到 systemctl。"; }
+svc_logs() { ensure_linux_only "macOS 使用 log 命令查看日志。"; local svc="${1:-}" lines="${2:-50}"; [[ -n "$svc" ]] || read -r -p "服务名: " svc; has_cmd journalctl && run journalctl -u "$svc" -n "$lines" --no-pager || warn "未检测到 journalctl。"; }
+
+# ---------- 磁盘清理 ----------
+disk_cleanup_journal() { ensure_linux_only "macOS 日志由系统自动管理。"; local days="${1:-7}"; confirm "即将清理 ${days} 天前的 systemd journal 日志。是否继续？" || cancelled; has_cmd journalctl && { run journalctl --vacuum-time="${days}d"; success "Journal 日志清理完成。"; } || warn "未检测到 journalctl。"; }
+disk_cleanup_old_kernels() { ensure_linux_only "macOS 内核由系统更新管理。"; confirm "即将清理旧内核。是否继续？" || cancelled; case "$PKG_MANAGER" in apt) run apt-get autoremove --purge -y ;; dnf|yum) run dnf remove -y "$(rpm -q kernel | grep -v "$(uname -r)" 2>/dev/null || true)" 2>/dev/null || warn "未找到需清理的旧内核。";; pacman) run pacman -Rns "$(pacman -Qdtq 2>/dev/null || true)" 2>/dev/null || true ;; *) warn "未检测到支持的包管理器。";; esac; success "旧内核清理完成。"; }
+disk_cleanup_packages() { confirm "即将清理包管理器缓存。是否继续？" || cancelled; case "$PKG_MANAGER" in apt) run apt-get clean; run apt-get autoclean ;; dnf|yum) run dnf clean all 2>/dev/null || run yum clean all ;; pacman) run pacman -Scc --noconfirm 2>/dev/null || run pacman -Sc --noconfirm ;; brew) brew_run cleanup -s ;; *) warn "未检测到支持的包管理器。";; esac; success "包缓存清理完成。"; }
+disk_cleanup_docker() { has_cmd docker || fatal "未检测到 docker 命令。"; confirm "即将清理 Docker 未使用的镜像/容器/卷/网络。是否继续？" || cancelled; run docker system prune -af --volumes 2>/dev/null || run docker system prune -af; success "Docker 清理完成。"; }
+disk_cleanup_summary() { echo "========== 磁盘使用概况 =========="; df -hT 2>/dev/null || df -h; echo; echo "========== 大目录 Top 10 =========="; has_cmd du && du -h --max-depth=3 / 2>/dev/null | sort -rh | head -10 || du -h -d 2 / 2>/dev/null | sort -rh | head -10 2>/dev/null || warn "无法扫描磁盘使用。"; }
+
+# ---------- SSL 证书检查 ----------
+ssl_check() { local host="${1:-}" port="${2:-443}"; [[ -n "$host" ]] || read -r -p "域名: " host; [[ -n "$host" ]] || cancelled; info "检查 SSL 证书：${host}:${port}"; echo | openssl s_client -servername "$host" -connect "${host}:${port}" 2>/dev/null | openssl x509 -noout -dates -subject -issuer 2>/dev/null || { has_cmd curl && curl -svI "https://${host}" 2>&1 | grep -E 'expire|subject|issuer|SSL' || true; }; }
+ssl_check_batch() { ensure_linux_only "批量检查依赖 curl。"; local file="${1:-}" host port; [[ -n "$file" ]] || { echo "输入包含域名列表的文件（每行一个域名或 host:port）："; read -r file; }; [[ -f "$file" ]] || fatal "文件不存在：$file"; while IFS= read -r line; do [[ -z "$line" || "$line" == \#* ]] && continue; host="${line%%:*}"; port="${line##*:}"; [[ "$port" == "$host" ]] && port=443; printf '%-40s ' "$host"; echo | openssl s_client -servername "$host" -connect "${host}:${port}" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | sed 's/notAfter=/到期: /' || echo "✗ 连接失败"; done < "$file"; }
+
+# ---------- 系统更新 ----------
+system_update_check() { case "$PKG_MANAGER" in apt) run apt-get update; run apt list --upgradable 2>/dev/null | head -30 ;; dnf) run dnf check-update 2>/dev/null | head -30 || true ;; yum) run yum check-update 2>/dev/null | head -30 || true ;; pacman) run pacman -Sy; run pacman -Qu 2>/dev/null | head -30 ;; brew) brew_run update; brew_run outdated ;; *) warn "未检测到支持的包管理器。";; esac; }
+system_update_security() { ensure_linux_only "macOS 安全更新通过系统偏好设置安装。"; confirm "即将安装安全更新。是否继续？" || cancelled; case "$PKG_MANAGER" in apt) run apt-get update; run unattended-upgrade -d 2>/dev/null || run apt-get upgrade -y; success "安全更新完成。";; dnf) run dnf update --security -y 2>/dev/null || run dnf update-minimal --security -y 2>/dev/null || warn "dnf 安全更新不可用，请使用 system-update all。";; yum) run yum update --security -y 2>/dev/null || warn "yum 安全更新不可用，请使用 system-update all。";; *) warn "未检测到支持的包管理器。";; esac; }
+system_update_all() { confirm "即将更新所有系统软件包。是否继续？" || cancelled; case "$PKG_MANAGER" in apt) run apt-get update; run apt-get upgrade -y; run apt-get dist-upgrade -y 2>/dev/null || true; success "系统更新完成。";; dnf|yum) run dnf update -y 2>/dev/null || run yum update -y; success "系统更新完成。";; pacman) run pacman -Syu --noconfirm; success "系统更新完成。";; brew) brew_run update; brew_run upgrade; success "Homebrew 更新完成。";; *) warn "未检测到支持的包管理器。";; esac; }
+
 # ---------- 菜单 ----------
 menu_clear() { [[ -t 1 ]] && clear || true; }
 menu_invalid() { warn "无效选择，请重新输入。"; sleep 1; }
@@ -865,6 +910,42 @@ menu_perf() { local c; while true; do menu_clear; cat <<'EOF_MENU'
 0) 返回上一级
 EOF_MENU
 read -r -p "选择: " c; case "${c:-}" in 1) menu_action "快速性能巡检" perf_quick ;; 2) menu_action "安装/检查性能工具" ensure_perf_tools ;; 0) return ;; *) menu_invalid ;; esac; done; }
+menu_service() { local c; while true; do menu_clear; cat <<'EOF_MENU'
+[服务管理 - systemd]
+1) 列出运行中的服务
+2) 查看服务状态
+3) 重启服务
+4) 启用服务（开机自启）
+5) 禁用服务
+6) 查看服务日志
+0) 返回上一级
+EOF_MENU
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "列出服务" svc_list ;; 2) menu_action "查看服务状态" svc_status ;; 3) menu_action "重启服务" svc_restart ;; 4) menu_action "启用服务" svc_enable ;; 5) menu_action "禁用服务" svc_disable ;; 6) menu_action "查看服务日志" svc_logs ;; 0) return ;; *) menu_invalid ;; esac; done; }
+menu_disk_cleanup() { local c; while true; do menu_clear; cat <<'EOF_MENU'
+[磁盘清理]
+1) 查看磁盘使用概况
+2) 清理 systemd journal 日志
+3) 清理旧内核
+4) 清理包管理器缓存
+5) 清理 Docker 未使用资源
+0) 返回上一级
+EOF_MENU
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "磁盘概况" disk_cleanup_summary ;; 2) menu_action "清理 Journal" disk_cleanup_journal ;; 3) menu_action "清理旧内核" disk_cleanup_old_kernels ;; 4) menu_action "清理包缓存" disk_cleanup_packages ;; 5) menu_action "清理 Docker" disk_cleanup_docker ;; 0) return ;; *) menu_invalid ;; esac; done; }
+menu_ssl() { local c; while true; do menu_clear; cat <<'EOF_MENU'
+[SSL 证书检查]
+1) 检查单个域名证书
+2) 批量检查证书（从文件读取域名列表）
+0) 返回上一级
+EOF_MENU
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "检查 SSL 证书" ssl_check ;; 2) menu_action "批量检查 SSL" ssl_check_batch ;; 0) return ;; *) menu_invalid ;; esac; done; }
+menu_system_update() { local c; while true; do menu_clear; cat <<'EOF_MENU'
+[系统更新]
+1) 检查可用更新
+2) 仅安装安全更新
+3) 更新所有软件包
+0) 返回上一级
+EOF_MENU
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "检查更新" system_update_check ;; 2) menu_action "安装安全更新" system_update_security ;; 3) menu_action "更新所有包" system_update_all ;; 0) return ;; *) menu_invalid ;; esac; done; }
 main_menu() { local c; while true; do menu_clear; cat <<EOF_MENU
 Linux/macOS Admin Toolkit v${TOOL_VERSION}
 系统：${OS_NAME} (${PLATFORM:-unknown})    包管理器：${PKG_MANAGER:-unknown}
@@ -876,10 +957,14 @@ Linux/macOS Admin Toolkit v${TOOL_VERSION}
 5) Swap 管理
 6) LVM 管理
 7) 性能瓶颈排查
-8) 查看系统环境
+8) 服务管理 (systemd)
+9) 磁盘清理
+10) SSL 证书检查
+11) 系统更新
+12) 查看系统环境
 0) 退出
 EOF_MENU
-read -r -p "请选择: " c; case "${c:-}" in 1) menu_common_tools ;; 2) menu_mirror ;; 3) menu_docker ;; 4) menu_firewall ;; 5) menu_swap ;; 6) menu_lvm ;; 7) menu_perf ;; 8) menu_action "查看系统环境" print_env ;; 0) exit 0 ;; *) menu_invalid ;; esac; done; }
+read -r -p "请选择: " c; case "${c:-}" in 1) menu_common_tools ;; 2) menu_mirror ;; 3) menu_docker ;; 4) menu_firewall ;; 5) menu_swap ;; 6) menu_lvm ;; 7) menu_perf ;; 8) menu_service ;; 9) menu_disk_cleanup ;; 10) menu_ssl ;; 11) menu_system_update ;; 12) menu_action "查看系统环境" print_env ;; 0) exit 0 ;; *) menu_invalid ;; esac; done; }
 
 # ---------- CLI ----------
 usage() { cat <<EOF_USAGE
@@ -907,10 +992,24 @@ usage() { cat <<EOF_USAGE
   $PROGRAM_NAME swap add --size 4G --path /swapfile
   $PROGRAM_NAME lvm list
   $PROGRAM_NAME perf quick
+  $PROGRAM_NAME service list
+  $PROGRAM_NAME service status <服务名>
+  $PROGRAM_NAME service restart <服务名>
+  $PROGRAM_NAME disk-cleanup summary
+  $PROGRAM_NAME disk-cleanup journal --days 7
+  $PROGRAM_NAME disk-cleanup old-kernels
+  $PROGRAM_NAME disk-cleanup packages
+  $PROGRAM_NAME disk-cleanup docker
+  $PROGRAM_NAME ssl-check example.com
+  $PROGRAM_NAME ssl-check example.com:8443
+  $PROGRAM_NAME ssl-check-batch domains.txt
+  $PROGRAM_NAME system-update check
+  $PROGRAM_NAME system-update security
+  $PROGRAM_NAME system-update all
 EOF_USAGE
 }
 get_opt_value() { local key="$1" arg next; shift || true; while [[ "$#" -gt 0 ]]; do arg="$1"; case "$arg" in "$key") shift || true; next="${1:-}"; [[ -n "$next" ]] || return 1; printf '%s' "$next"; return 0 ;; "$key"=*) printf '%s' "${arg#*=}"; return 0 ;; esac; shift || true; done; return 1; }
-main() { detect_os; while [[ "$#" -gt 0 ]]; do case "${1:-}" in -y|--yes) ASSUME_YES=1; shift ;; -n|--dry-run) DRY_RUN=1; shift ;; --no-color) NO_COLOR=1; shift ;; -h|--help) usage; exit 0 ;; *) break ;; esac; done; local module="${1:-menu}" action="${2:-}"; case "$module" in menu|"") require_root "$@"; main_menu ;; env) print_env ;; tools) require_root "$@"; case "${action:-}" in install) install_common_tools ;; status) tool_status ;; config) case "${3:-all}" in all) configure_common_tools ;; vim) configure_vim ;; tmux) configure_tmux ;; git) configure_git ;; zsh-basic) configure_zsh_basic ;; *) fatal "未知 tools config 动作：${3:-}" ;; esac ;; oh-my-zsh) install_oh_my_zsh "$(get_opt_value --github-proxy "$@" || true)" ;; zsh-plugins) install_zsh_plugins "$(get_opt_value --github-proxy "$@" || true)" ;; install-z) install_rupa_z "$(get_opt_value --github-proxy "$@" || true)" ;; zsh-full) configure_zsh_full ;; chsh-zsh) change_default_shell_to_zsh ;; *) fatal "未知 tools 动作：${action:-}" ;; esac ;; mirror) require_root "$@"; case "${action:-}" in backup) backup_sources ;; set) set_system_mirror "$(get_opt_value --source "$@" || printf '%s' "$DEFAULT_SOURCE")" ;; list-backups) list_source_backups ;; restore) restore_sources "${3:-}" ;; refresh) refresh_pkg_cache ;; *) fatal "未知 mirror 动作：${action:-}" ;; esac ;; docker) require_root "$@"; case "${action:-}" in install) install_docker "$(get_opt_value --source "$@" || printf '%s' "$DEFAULT_DOCKER_SOURCE")" ;; mirror) configure_docker_registry_mirror "$(get_opt_value --registry "$@" || true)" ;; save-images) save_docker_images_one_by_one "$(get_opt_value --dir "$@" || true)" ;; status) menu_docker_status ;; uninstall) uninstall_docker "$(get_opt_value --remove-data "$@" || printf '0')" ;; *) fatal "未知 docker 动作：${action:-}" ;; esac ;; firewall) require_root "$@"; case "${action:-}" in install) install_firewall ;; status) firewall_status ;; enable) firewall_enable ;; disable) firewall_disable ;; allow) firewall_allow "${3:-}" ;; deny) firewall_deny "${3:-}" ;; uninstall) uninstall_firewall ;; *) fatal "未知 firewall 动作：${action:-}" ;; esac ;; swap) require_root "$@"; case "${action:-}" in list) swap_list ;; add) swap_add "$(get_opt_value --size "$@" || true)" "$(get_opt_value --path "$@" || printf '/swapfile')" ;; resize) swap_resize "$(get_opt_value --size "$@" || true)" "$(get_opt_value --path "$@" || printf '/swapfile')" ;; delete) swap_delete "$(get_opt_value --path "$@" || true)" ;; *) fatal "未知 swap 动作：${action:-}" ;; esac ;; lvm) require_root "$@"; case "${action:-}" in list) lvm_list ;; install) ensure_lvm ;; create-pv) lvm_create_pv "${3:-}" ;; create-vg) shift 2; lvm_create_vg "$@" ;; create-lv) lvm_create_lv "${3:-}" "${4:-}" "${5:-}" ;; extend-lv) lvm_extend_lv "${3:-}" "${4:-}" ;; remove-lv) lvm_remove_lv "${3:-}" ;; *) fatal "未知 lvm 动作：${action:-}" ;; esac ;; perf) case "${action:-quick}" in quick) perf_quick ;; install-tools) ensure_perf_tools ;; *) fatal "未知 perf 动作：${action:-}" ;; esac ;; docker-offline) require_root "$@"; shift 2; case "${action:-}" in help) cat <<'EOF_OFFLINE_HELP'
+main() { detect_os; load_config; audit_log "START: $0 $*"; while [[ "$#" -gt 0 ]]; do case "${1:-}" in -y|--yes) ASSUME_YES=1; shift ;; -n|--dry-run) DRY_RUN=1; shift ;; --no-color) NO_COLOR=1; shift ;; -h|--help) usage; exit 0 ;; *) break ;; esac; done; local module="${1:-menu}" action="${2:-}"; case "$module" in menu|"") require_root "$@"; main_menu ;; env) print_env ;; tools) require_root "$@"; case "${action:-}" in install) install_common_tools ;; status) tool_status ;; config) case "${3:-all}" in all) configure_common_tools ;; vim) configure_vim ;; tmux) configure_tmux ;; git) configure_git ;; zsh-basic) configure_zsh_basic ;; *) fatal "未知 tools config 动作：${3:-}" ;; esac ;; oh-my-zsh) install_oh_my_zsh "$(get_opt_value --github-proxy "$@" || true)" ;; zsh-plugins) install_zsh_plugins "$(get_opt_value --github-proxy "$@" || true)" ;; install-z) install_rupa_z "$(get_opt_value --github-proxy "$@" || true)" ;; zsh-full) configure_zsh_full ;; chsh-zsh) change_default_shell_to_zsh ;; *) fatal "未知 tools 动作：${action:-}" ;; esac ;; mirror) require_root "$@"; case "${action:-}" in backup) backup_sources ;; set) set_system_mirror "$(get_opt_value --source "$@" || printf '%s' "$DEFAULT_SOURCE")" ;; list-backups) list_source_backups ;; restore) restore_sources "${3:-}" ;; refresh) refresh_pkg_cache ;; *) fatal "未知 mirror 动作：${action:-}" ;; esac ;; docker) require_root "$@"; case "${action:-}" in install) install_docker "$(get_opt_value --source "$@" || printf '%s' "$DEFAULT_DOCKER_SOURCE")" ;; mirror) configure_docker_registry_mirror "$(get_opt_value --registry "$@" || true)" ;; save-images) save_docker_images_one_by_one "$(get_opt_value --dir "$@" || true)" ;; status) menu_docker_status ;; uninstall) uninstall_docker "$(get_opt_value --remove-data "$@" || printf '0')" ;; *) fatal "未知 docker 动作：${action:-}" ;; esac ;; firewall) require_root "$@"; case "${action:-}" in install) install_firewall ;; status) firewall_status ;; enable) firewall_enable ;; disable) firewall_disable ;; allow) firewall_allow "${3:-}" ;; deny) firewall_deny "${3:-}" ;; uninstall) uninstall_firewall ;; *) fatal "未知 firewall 动作：${action:-}" ;; esac ;; swap) require_root "$@"; case "${action:-}" in list) swap_list ;; add) swap_add "$(get_opt_value --size "$@" || true)" "$(get_opt_value --path "$@" || printf '/swapfile')" ;; resize) swap_resize "$(get_opt_value --size "$@" || true)" "$(get_opt_value --path "$@" || printf '/swapfile')" ;; delete) swap_delete "$(get_opt_value --path "$@" || true)" ;; *) fatal "未知 swap 动作：${action:-}" ;; esac ;; lvm) require_root "$@"; case "${action:-}" in list) lvm_list ;; install) ensure_lvm ;; create-pv) lvm_create_pv "${3:-}" ;; create-vg) shift 2; lvm_create_vg "$@" ;; create-lv) lvm_create_lv "${3:-}" "${4:-}" "${5:-}" ;; extend-lv) lvm_extend_lv "${3:-}" "${4:-}" ;; remove-lv) lvm_remove_lv "${3:-}" ;; *) fatal "未知 lvm 动作：${action:-}" ;; esac ;; perf) case "${action:-quick}" in quick) perf_quick ;; install-tools) ensure_perf_tools ;; *) fatal "未知 perf 动作：${action:-}" ;; esac ;; docker-offline) require_root "$@"; shift 2; case "${action:-}" in help) cat <<'EOF_OFFLINE_HELP'
 docker-offline 模块：离线二进制安装 Docker Engine + Docker Compose
 
 动作：
@@ -933,5 +1032,5 @@ docker-offline 模块：离线二进制安装 Docker Engine + Docker Compose
   --package-file FILE      package 输出文件名
   --purge-data             uninstall 时同时删除数据
 EOF_OFFLINE_HELP
-;; status) offline_action_status ;; *) offline_parse_args "$@"; case "${action:-}" in download) offline_action_download ;; install) offline_action_install ;; package) offline_action_package ;; uninstall) offline_action_uninstall ;; *) fatal "未知 docker-offline 动作：${action:-}。支持：download/install/package/uninstall/status/help" ;; esac ;; esac ;; *) usage; fatal "未知模块：${module}" ;; esac; }
+;; status) offline_action_status ;; *) offline_parse_args "$@"; case "${action:-}" in download) offline_action_download ;; install) offline_action_install ;; package) offline_action_package ;; uninstall) offline_action_uninstall ;; *) fatal "未知 docker-offline 动作：${action:-}。支持：download/install/package/uninstall/status/help" ;; esac ;; esac ;; service) require_root "$@"; case "${action:-}" in list) svc_list ;; status) svc_status "${3:-}" ;; restart) svc_restart "${3:-}" ;; enable) svc_enable "${3:-}" ;; disable) svc_disable "${3:-}" ;; logs) svc_logs "${3:-}" "${4:-50}" ;; *) fatal "未知 service 动作：${action:-}。支持：list/status/restart/enable/disable/logs" ;; esac ;; disk-cleanup) require_root "$@"; case "${action:-}" in summary) disk_cleanup_summary ;; journal) disk_cleanup_journal "$(get_opt_value --days "$@" || printf '7')" ;; old-kernels) disk_cleanup_old_kernels ;; packages) disk_cleanup_packages ;; docker) disk_cleanup_docker ;; *) fatal "未知 disk-cleanup 动作：${action:-}。支持：summary/journal/old-kernels/packages/docker" ;; esac ;; ssl-check) ssl_check "${3:-}" "${4:-443}" ;; ssl-check-batch) ssl_check_batch "${3:-}" ;; system-update) require_root "$@"; case "${action:-}" in check) system_update_check ;; security) system_update_security ;; all) system_update_all ;; *) fatal "未知 system-update 动作：${action:-}。支持：check/security/all" ;; esac ;; *) usage; fatal "未知模块：${module}" ;; esac; }
 main "$@"
