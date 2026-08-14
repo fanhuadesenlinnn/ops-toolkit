@@ -11,13 +11,14 @@
 | [`sshm.sh`](./sshm.sh) | SSH 主机管理脚本，支持保存主机、按别名或 ID 连接、增删改查、搜索和备注。 | 可用 |
 | [`linux-admin-toolkit.sh`](./linux-admin-toolkit.sh) | Linux/macOS 运维工具箱，覆盖常用工具安装、软件源、Docker、防火墙、Swap/LVM 和性能排查。内含 `docker-offline` 模块支持离线二进制安装。 | 可用 |
 | [`install-docker-offline.sh`](./install-docker-offline.sh) | Docker 离线二进制独立安装脚本（功能已合并到 toolkit）；支持下载/安装/卸载/打包。 | 可用 |
+| [`lvm-manager.sh`](./lvm-manager.sh) | LVM 管理脚本，支持 PV/VG/LV 创建、扩容、删除、查询，自动挂载与 fstab 管理，支持 `--dry-run` 预览。 | 可用 |
 
 ## 快速开始
 
 ```bash
 git clone https://github.com/fanhuadesenlinnn/ops-toolkit.git
 cd ops-toolkit
-chmod +x sshm.sh linux-admin-toolkit.sh
+chmod +x sshm.sh linux-admin-toolkit.sh lvm-manager.sh
 ```
 
 查看帮助：
@@ -139,6 +140,43 @@ alias,user,host,port,identity,note
 ```
 
 离线安装模块支持的选项：`--resource-dir`、`--docker-version`、`--compose-version`、`--arch`、`--download-if-missing`、`--skip-docker`、`--skip-compose`、`--no-start`、`--no-enable`、`--data-root`、`--registry-mirror`、`--docker-channel`、`--package-file`、`--purge-data`。
+
+## lvm-manager.sh
+
+`lvm-manager.sh` 是独立的 LVM 管理工具，覆盖 PV / VG / LV 的创建、扩容、删除和查询，并自动处理挂载与 `/etc/fstab` 同步。高危操作均有确认（`-y` 可跳过），`-n/--dry-run` 可预览全部将要执行的命令。
+
+```bash
+./lvm-manager.sh --help          # 查看完整用法
+./lvm-manager.sh                 # 交互式菜单
+./lvm-manager.sh list all        # 查看 PV / VG / LV / 磁盘
+./lvm-manager.sh info -d /dev/sdb
+
+# 空盘 → PV + VG + LV + 格式化 + 挂载 + fstab（一条命令）
+./lvm-manager.sh --dry-run create -d /dev/sdb -v vg_data -l lv_data -s 100G -f xfs -m /data
+
+# 分步创建
+./lvm-manager.sh create-vg -d /dev/sdb -v vg_data
+./lvm-manager.sh create-lv -v vg_data -l lv_data -s 100G -f ext4 -m /data
+
+# 扩容：VG 加盘 / LV + 文件系统同步扩容
+./lvm-manager.sh extend -v vg_data -d /dev/sdc
+./lvm-manager.sh extend -v vg_data -l lv_data -s +50G
+./lvm-manager.sh extend -v vg_data -l lv_data -s max
+
+# 删除：LV / 整个 VG / PV
+./lvm-manager.sh delete -v vg_data -l lv_data
+./lvm-manager.sh delete -v vg_data
+./lvm-manager.sh delete -d /dev/sdc
+```
+
+大小参数支持绝对值（`100G`）、相对扩容（`+50G`，仅 extend）、百分比（`100%FREE` / `50%VG` / `50%PVS`）和便捷写法（`max` = `100%FREE`）。
+
+安全特性：
+
+- 创建 / 加盘前校验磁盘为空盘（无分区、无文件系统签名、未挂载、非 PV、无 holders / md 成员）；`wipefs` 探测失败时拒绝当作空盘，避免误擦有数据的盘。
+- 修改 `/etc/fstab` 前自动备份到 `/etc/fstab.bak.lvm-manager.*`；删除条目时先写临时文件再原子替换，避免写空。
+- 删除 LV 先确认，再关闭 swap、卸载、删 fstab、删 LV；用户在确认前取消不会改挂载和 fstab。LV 未激活时会先激活再读取信息，避免 fstab 残留悬空条目。
+- 失败时提示本次已落地的 LV / VG / PV 及对应清理命令。
 
 ## 兼容性
 
