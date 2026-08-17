@@ -1760,7 +1760,7 @@ health_check_time() {
   esac
 }
 health_check_network() {
-  local gw dns_ok=0 iface state
+  local gw iface state
   if is_linux; then
     gw="$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')"
     [[ -n "$gw" ]] && health_item OK "默认网关 ${gw}" || health_item CRIT "无默认路由"
@@ -1774,8 +1774,6 @@ health_check_network() {
     netstat -rn 2>/dev/null | head -n 8 || true
     health_item OK "macOS 路由表已列出（请人工确认默认网关）"
   fi
-  if has_cmd getent; then getent hosts localhost >/dev/null 2>&1 && dns_ok=1; fi
-  if [[ "$dns_ok" -eq 0 ]] && has_cmd ping; then ping -c 1 -W 2 127.0.0.1 >/dev/null 2>&1 && dns_ok=1; fi
   if has_cmd getent && getent hosts one.one.one.one >/dev/null 2>&1; then health_item OK "DNS 可解析外部域名"
   elif has_cmd nslookup && nslookup one.one.one.one >/dev/null 2>&1; then health_item OK "DNS 可解析外部域名"
   else health_item WARN "外部 DNS 解析失败或网络隔离"; fi
@@ -2078,7 +2076,16 @@ ssh_harden_apply() {
   [[ -n "$port" ]] && ssh_set_kv "$file" Port "$port"
   [[ -n "$allow_users" ]] && ssh_set_kv "$file" AllowUsers "${allow_users//,/ }"
   if [[ "$DRY_RUN" -eq 1 ]]; then success "dry-run：未真正改 sshd。"; return 0; fi
-  if has_cmd sshd; then sshd -t || fatal "sshd -t 失败，请用备份回滚：$file.bak.*"; fi
+  if has_cmd sshd && ! sshd -t; then
+    local latest
+    latest="$(ls -t "$file".bak.* 2>/dev/null | head -n1 || true)"
+    if [[ -n "$latest" && -f "$latest" ]]; then
+      warn "sshd -t 失败，正在从备份回滚：$latest"
+      run cp -a "$latest" "$file"
+      fatal "sshd -t 失败，已回滚到 ${latest}。请检查配置后重试。"
+    fi
+    fatal "sshd -t 失败，且未找到备份，请手动修复：$file"
+  fi
   if has_cmd systemctl; then run systemctl reload sshd 2>/dev/null || run systemctl reload ssh 2>/dev/null || run systemctl reload sshd.service || warn "reload 失败，请手动 systemctl reload sshd"
   elif has_cmd service; then run service ssh reload || run service sshd reload || true
   fi
@@ -2488,7 +2495,8 @@ sysconf_limits() {
       if [[ "$DRY_RUN" -eq 1 ]]; then info "+ limits $domain $item $value"
       else
         touch "$file"
-        grep -vE "^${domain}[[:space:]]+.+[[:space:]]+${item}[[:space:]]" "$file" > "${file}.tmp" || true
+        # limits 格式: domain type item value；用 awk 精确匹配 domain+item 去重，避免正则转义问题
+        awk -v d="$domain" -v it="$item" '$1==d && $3==it {next} {print}' "$file" > "${file}.tmp"
         printf '%s soft %s %s\n%s hard %s %s\n' "$domain" "$item" "$value" "$domain" "$item" "$value" >> "${file}.tmp"
         cat "${file}.tmp" > "$file"; rm -f "${file}.tmp"
       fi
@@ -2669,6 +2677,7 @@ proc_kill() {
   [[ "$pid" =~ ^[0-9]+$ ]] || fatal "非法 PID：$pid"
   [[ "$sig" =~ ^[A-Z0-9]+$ ]] || fatal "非法信号：$sig"
   [[ "$pid" != "1" ]] || fatal "拒绝向 PID 1 发信号。"
+  [[ "$pid" != "$$" ]] || fatal "拒绝向脚本自身进程发信号。"
   ps -p "$pid" -o pid,user,stat,etime,cmd || fatal "进程不存在：$pid"
   confirm "即将向 PID ${pid} 发送 SIG${sig}。是否继续？" || cancelled
   run kill -s "$sig" "$pid"
@@ -3226,7 +3235,7 @@ cmd_system_update() {
 cmd_health() {
   local action="${2:-check}"
   case "$action" in
-    check) health_check ;;
+    check) health_run_checks ;;
     report) health_report "$(get_opt_value --out "$@" || true)" ;;
     *) fatal "未知 health 动作：${action:-}。支持：check/report" ;;
   esac
@@ -3364,6 +3373,9 @@ main() {
       ;;
     disk)
       case "${1:-}" in grow|smart) require_root "$@" ;; *) : ;; esac
+      ;;
+    user)
+      case "${1:-}" in list|info|keys) : ;; *) require_root "$@" ;; esac
       ;;
     *) require_root "$@" ;;
   esac

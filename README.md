@@ -177,8 +177,8 @@ alias,user,host,port,identity,note
 
 | 模块 | 用途 |
 | --- | --- |
-| `health` | 主机巡检：负载、内存、磁盘/inode、只读挂载、僵尸/D 进程、OOM、失败服务、时间同步、网关/DNS。可输出报告。 |
-| `user` / `ssh-harden` | 用户增删锁、sudo、authorized_keys；SSH 配置审计与基线（禁空密码、可选禁 root/密码登录）。改 sshd 前备份并 `sshd -t`。 |
+| `health` | 主机巡检：负载、内存、磁盘/inode、只读挂载、僵尸/D 进程、OOM、失败服务、时间同步、网关/DNS。可输出报告。`health check` 退出码：0=正常，1=有警告，2=有严重项（菜单内执行不报红）。 |
+| `user` / `ssh-harden` | 用户增删锁、sudo、authorized_keys；SSH 配置审计与基线（禁空密码、可选禁 root/密码登录）。改 sshd 前备份、`sshd -t` 校验，失败自动回滚。 |
 | `cron` | 查看用户 crontab、`/etc/cron*`、systemd timer；追加/删除、备份/恢复。 |
 | `log` | journal 查询、最近 OOM/IO/panic/登录失败、日志关键词搜索、故障现场打包。 |
 | `net` | 地址/路由/DNS、监听端口、端口占用、ping、TCP 探测、traceroute。 |
