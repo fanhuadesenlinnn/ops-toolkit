@@ -103,7 +103,17 @@ alias,user,host,port,identity,note
 ./linux-admin-toolkit.sh docker install --source tuna
 ./linux-admin-toolkit.sh firewall status
 ./linux-admin-toolkit.sh swap add --size 4G --path /swapfile
-./linux-admin-toolkit.sh lvm list
+./linux-admin-toolkit.sh lvm list                 # 查询 PV / VG / LV / 磁盘
+./linux-admin-toolkit.sh lvm info -d /dev/sdb     # 查看单块磁盘
+./linux-admin-toolkit.sh lvm create -d /dev/sdb -v vg_data -l lv_data -s 100G -f xfs -m /data
+./linux-admin-toolkit.sh lvm create-vg -d /dev/sdb -v vg_data
+./linux-admin-toolkit.sh lvm create-lv -v vg_data -l lv_data -s 100G -f ext4 -m /data
+./linux-admin-toolkit.sh lvm extend -v vg_data -d /dev/sdc       # VG 加盘
+./linux-admin-toolkit.sh lvm extend -v vg_data -l lv_data -s +50G # LV+文件系统扩容
+./linux-admin-toolkit.sh lvm delete -v vg_data -l lv_data          # 删 LV
+./linux-admin-toolkit.sh lvm delete -v vg_data                     # 删整个 VG
+./linux-admin-toolkit.sh lvm delete -d /dev/sdc                    # 删 PV
+./linux-admin-toolkit.sh lvm sizes                # 大小格式说明 (100G/+50G/100%FREE/max)
 ./linux-admin-toolkit.sh perf quick
 ```
 
@@ -144,6 +154,8 @@ alias,user,host,port,identity,note
 ## lvm-manager.sh
 
 `lvm-manager.sh` 是独立的 LVM 管理工具，覆盖 PV / VG / LV 的创建、扩容、删除和查询，并自动处理挂载与 `/etc/fstab` 同步。高危操作均有确认（`-y` 可跳过），`-n/--dry-run` 可预览全部将要执行的命令。
+
+> 注：`linux-admin-toolkit.sh` 的 `lvm` 模块已融合本脚本的全部功能（含空盘校验、fstab 管理、回滚、dry-run），用法相同：`./linux-admin-toolkit.sh lvm create -d /dev/sdb -v vg_data ...`。本脚本继续保留，可独立使用。
 
 ```bash
 ./lvm-manager.sh --help          # 查看完整用法

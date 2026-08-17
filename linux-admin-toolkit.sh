@@ -47,6 +47,15 @@ OFFLINE_COMPOSE_ARCH=""
 GITHUB_PROXY_PREFIX="${GITHUB_PROXY_PREFIX:-}"
 CHOSEN_MIRROR_SOURCE=""
 OS_ID=""; OS_LIKE=""; OS_NAME=""; OS_VERSION_ID=""; OS_CODENAME=""; PKG_MANAGER=""; PLATFORM=""
+# ---------- LVM 管理变量 (融合自 lvm-manager.sh) ----------
+LVM_DISK=""; LVM_VG=""; LVM_LV=""; LVM_SIZE=""; LVM_FS=""; LVM_MOUNT=""
+LVM_POS=()
+LVM_FSTAB_BACKED_UP=0
+LVM_PLANNED_VG=0
+LVM_CREATED_PV=0
+LVM_CREATED_VG=0
+LVM_CREATED_LV=0
+LVM_MOUNT_CONFIRMED=0
 
 _color() { local code="$1"; shift || true; if [[ "$NO_COLOR" -eq 1 || ! -t 1 ]]; then printf '%s\n' "$*"; else printf '\033[%sm%s\033[0m\n' "$code" "$*"; fi; }
 info() { _color "1;34" "[INFO] $*"; }
@@ -776,13 +785,800 @@ swap_list() { ensure_linux_only "macOS 的虚拟内存由系统自动管理。";
 swap_add() { ensure_linux_only "macOS 不支持此 Linux swapfile 操作。"; local size="${1:-}" path="${2:-/swapfile}" input_path; [[ -n "$size" ]] || read -r -p "Swap 大小，如 2G/4096M: " size; [[ -n "$size" ]] || cancelled; [[ "${2:-}" == "" ]] && { read -r -p "Swap 文件路径 [$path]: " input_path || true; path="${input_path:-$path}"; }; [[ ! -e "$path" ]] || fatal "文件已存在：$path"; confirm "即将创建 ${path}，大小 ${size}，并写入 /etc/fstab。是否继续？" || cancelled; has_cmd fallocate && run fallocate -l "$size" "$path" || fatal "缺少 fallocate，请手动创建 swap 文件。"; run chmod 600 "$path"; run mkswap "$path"; run swapon "$path"; append_line_if_missing /etc/fstab "$path none swap sw 0 0"; success "Swap 已增加。"; }
 swap_delete() { ensure_linux_only "macOS 不支持此 Linux swapfile 操作。"; local path="${1:-}"; [[ -n "$path" ]] || { swap_list; read -r -p "输入要删除的 swap 路径，如 /swapfile: " path; }; [[ -n "$path" ]] || cancelled; confirm "即将停用并删除 ${path}。是否继续？" || cancelled; swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$path" && run swapoff "$path" || true; [[ -f /etc/fstab ]] && run sed -i.bak "\#^${path} #d" /etc/fstab; [[ -e "$path" ]] && run rm -f "$path"; success "Swap 已删除。"; }
 swap_resize() { local size="${1:-}" path="${2:-/swapfile}"; [[ -n "$size" ]] || read -r -p "新的 swap 大小，如 4G: " size; [[ -e "$path" ]] && swap_delete "$path"; swap_add "$size" "$path"; }
-ensure_lvm() { ensure_linux_only "macOS 不支持 Linux LVM。"; has_cmd lvm || pkg_install lvm2; has_cmd lvm || fatal "lvm2 安装后仍未检测到 lvm 命令。"; }
-lvm_list() { ensure_linux_only "macOS 不支持 Linux LVM。"; has_cmd lsblk && lsblk || true; has_cmd pvs && pvs || warn "缺少 pvs，请先安装 lvm2。"; has_cmd vgs && vgs || true; has_cmd lvs && lvs || true; }
-lvm_create_pv() { ensure_lvm; local dev="${1:-}"; [[ -n "$dev" ]] || { lsblk; read -r -p "输入要初始化为 PV 的设备，如 /dev/sdb1: " dev; }; [[ -b "$dev" ]] || fatal "不是块设备：$dev"; confirm "确认对 ${dev} 执行 pvcreate？这可能破坏原数据。" || cancelled; run pvcreate "$dev"; }
-lvm_create_vg() { ensure_lvm; local vg="${1:-}" line; shift || true; [[ -n "$vg" ]] || read -r -p "VG 名称: " vg; [[ "$#" -eq 0 ]] && { read -r -p "输入 PV 设备，多个用空格分隔: " line; set -- $line; }; confirm "即将创建 VG ${vg}，使用 PV：$*。是否继续？" || cancelled; run vgcreate "$vg" "$@"; }
-lvm_create_lv() { ensure_lvm; local vg="${1:-}" name="${2:-}" size="${3:-}"; [[ -n "$vg" ]] || { vgs; read -r -p "VG 名称: " vg; }; [[ -n "$name" ]] || read -r -p "LV 名称: " name; [[ -n "$size" ]] || read -r -p "LV 大小，如 20G 或 100%FREE: " size; confirm "即将在 VG ${vg} 中创建 LV ${name}，大小 ${size}。是否继续？" || cancelled; [[ "$size" == *%* ]] && run lvcreate -n "$name" -l "$size" "$vg" || run lvcreate -n "$name" -L "$size" "$vg"; }
-lvm_extend_lv() { ensure_lvm; local lv="${1:-}" size="${2:-}"; [[ -n "$lv" ]] || { lvs; read -r -p "LV 路径，如 /dev/vg0/data: " lv; }; [[ -n "$size" ]] || read -r -p "扩容大小，如 +10G 或 +100%FREE: " size; confirm "即将扩容 ${lv}，规格 ${size}。是否继续？" || cancelled; [[ "$size" == *%* ]] && run lvextend -r -l "$size" "$lv" || run lvextend -r -L "$size" "$lv"; }
-lvm_remove_lv() { ensure_lvm; local lv="${1:-}"; [[ -n "$lv" ]] || { lvs; read -r -p "要删除的 LV 路径: " lv; }; confirm "确认删除 LV ${lv}？这会删除数据。" || cancelled; run lvremove -y "$lv"; }
+# ---------- LVM 管理 (融合自 lvm-manager.sh: 创建/扩容/删除/查询, 自动挂载+fstab, dry-run) ----------
+ensure_lvm() { ensure_linux_only "macOS 不支持 Linux LVM。"; has_cmd lvm || pkg_install lvm2; local missing=(); has_cmd pvcreate || missing+=(lvm2); has_cmd mkfs.xfs || missing+=(xfsprogs); has_cmd mkfs.ext4 || missing+=(e2fsprogs); (( ${#missing[@]} > 0 )) && pkg_install "${missing[@]}"; lvm_check_deps || fatal "LVM 依赖工具仍不完整，请执行: $(lvm_pkg_hint)"; }
+lvm_pkg_hint() {
+  local pkgs="lvm2 xfsprogs e2fsprogs"
+  if   has_cmd pacman; then echo "sudo pacman -S $pkgs"
+  elif has_cmd apt-get; then echo "sudo apt install $pkgs"
+  elif has_cmd dnf;    then echo "sudo dnf install $pkgs"
+  elif has_cmd yum;    then echo "sudo yum install $pkgs"
+  elif has_cmd zypper; then echo "sudo zypper install $pkgs"
+  else echo "$pkgs"
+  fi
+}
+lvm_check_deps() {
+  local cmds=(pvcreate pvremove vgcreate vgextend vgremove vgreduce
+              lvcreate lvextend lvremove lvchange
+              pvs vgs lvs blkid findmnt lsblk mount umount)
+  local missing=() c
+  for c in "${cmds[@]}"; do
+    has_cmd "$c" || missing+=("$c")
+  done
+  if (( ${#missing[@]} > 0 )); then
+    error "缺少必要命令: ${missing[*]}"
+    warn "请先安装: $(lvm_pkg_hint)"
+    return 1
+  fi
+}
+lvm_normalize_fs() {
+  local fs=${1,,}
+  case $fs in
+    xfs|ext4) printf '%s\n' "$fs" ;;
+    *)        printf '%s\n' "$1" ;;
+  esac
+}
+lvm_fs_tools_check() {
+  local fs c
+  fs=$(lvm_normalize_fs "$1")
+  case $fs in
+    xfs)
+      for c in mkfs.xfs xfs_growfs; do
+        has_cmd "$c" || { error "缺少 $c，请安装 xfsprogs ($(lvm_pkg_hint))"; return 1; }
+      done ;;
+    ext4)
+      for c in mkfs.ext4 resize2fs; do
+        has_cmd "$c" || { error "缺少 $c，请安装 e2fsprogs ($(lvm_pkg_hint))"; return 1; }
+      done ;;
+    *)
+      error "不支持的文件系统: $1 (仅支持 xfs / ext4)"
+      return 1 ;;
+  esac
+}
+lvm_valid_name() {
+  local name=$1 what=$2
+  if [[ -z $name ]]; then error "$what 不能为空"; return 1; fi
+  if (( ${#name} > 127 )); then error "$what 过长 (最多 127 字符): $name"; return 1; fi
+  if [[ $name == -* || $name == .* ]]; then error "$what 不能以 '-' 或 '.' 开头: $name"; return 1; fi
+  if [[ $name == */* ]]; then error "$what 不能包含 '/': $name"; return 1; fi
+  if [[ ! $name =~ ^[A-Za-z0-9._+-]+$ ]]; then error "$what 只能包含字母、数字和 ._+- : $name"; return 1; fi
+}
+lvm_lv_dev() {
+  local vg=$1 lv=$2 mapper
+  if [[ -e "/dev/$vg/$lv" ]]; then printf '%s\n' "/dev/$vg/$lv"; return 0; fi
+  mapper="/dev/mapper/${vg//-/--}-${lv//-/--}"
+  if [[ -e $mapper ]]; then printf '%s\n' "$mapper"; return 0; fi
+  printf '%s\n' "/dev/$vg/$lv"
+}
+lvm_confirm() { [[ "$DRY_RUN" -eq 1 ]] && return 0; confirm "$@"; }
+lvm_confirm_danger() {
+  local msg="$1" ans=""
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  if [[ "$ASSUME_YES" -eq 1 ]]; then warn "$msg [自动确认 -y]"; return 0; fi
+  printf '%s 危险操作，请输入 yes 确认: ' "$msg"
+  read -r ans || true
+  [[ "${ans:-}" == "yes" ]]
+}
+lvm_pv_exists() { pvs "$1" >/dev/null 2>&1; }
+lvm_vg_exists() { vgs "$1" >/dev/null 2>&1; }
+lvm_lv_exists() { lvs "$(lvm_lv_dev "$1" "$2")" >/dev/null 2>&1 || lvs "/dev/$1/$2" >/dev/null 2>&1; }
+lvm_require_vg() {
+  if lvm_vg_exists "$1"; then return 0; fi
+  if [[ $DRY_RUN -eq 1 && $LVM_PLANNED_VG -eq 1 ]]; then return 0; fi
+  error "卷组 $1 不存在"
+  return 1
+}
+lvm_pv_in_vg() {
+  local vgname
+  vgname=$(pvs --noheadings -o vg_name "$1" 2>/dev/null | awk '{print $1}' || true)
+  [[ $vgname == "$2" ]]
+}
+lvm_vg_free_mb() { vgs --noheadings --nosuffix --units m -o vg_free "$1" 2>/dev/null | awk '{printf "%d", $1}' || true; }
+lvm_vg_free_mb_planned() {
+  local vg=$1 free extra=0
+  free=$(lvm_vg_free_mb "$vg")
+  free=${free:-0}
+  if [[ $DRY_RUN -eq 1 && -n ${LVM_DISK:-} ]] && ! lvm_pv_in_vg "$LVM_DISK" "$vg"; then
+    extra=$(lvm_disk_size_mb "$LVM_DISK" || true)
+    extra=${extra:-0}
+    if (( extra > 0 )); then
+      free=$((free + extra))
+      printf '%s\n' "[dry-run] 加上将加入的磁盘 $LVM_DISK 估算可用空间: ${free}MB (未计入 LVM 元数据开销)" >&2
+    fi
+  fi
+  printf '%d\n' "$free"
+}
+lvm_lv_size_mb() { lvs --noheadings --nosuffix --units m -o lv_size "$(lvm_lv_dev "$1" "$2")" 2>/dev/null | awk '{printf "%d", $1}' || true; }
+lvm_disk_size_mb() {
+  local bytes
+  bytes=$(lsblk -bno SIZE -d "$1" 2>/dev/null | awk 'NR==1 {print $1}' || true)
+  [[ -n $bytes ]] || { echo 0; return 1; }
+  awk -v b="$bytes" 'BEGIN { printf "%d", b/1024/1024 }'
+}
+lvm_to_mb() {
+  echo "$1" | awk '{
+    v=$0; unit="";
+    if (match(v,/[kKmMgGtTpPeE]$/)) { unit=substr(v,RSTART,1); v=substr(v,1,RSTART-1) }
+    n=v+0; m=1;
+    if (unit=="K"||unit=="k") m=1/1024;
+    else if (unit=="G"||unit=="g") m=1024;
+    else if (unit=="T"||unit=="t") m=1024*1024;
+    else if (unit=="P"||unit=="p") m=1024*1024*1024;
+    else if (unit=="E"||unit=="e") m=1024*1024*1024*1024;
+    printf "%d", n*m
+  }'
+}
+lvm_valid_size() { [[ $1 =~ ^\+?[0-9]+([.][0-9]+)?[kKmMgGtTpP]?$ || $1 =~ ^\+?[0-9]+%[A-Z]+$ ]]; }
+lvm_normalize_size() {
+  local s=$1
+  case $s in
+    max|MAX|all|ALL) printf '%s\n' "100%FREE"; return ;;
+  esac
+  if [[ $s =~ ^(\+?[0-9]+%)([A-Za-z]+)$ ]]; then
+    printf '%s%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]^^}"
+    return
+  fi
+  printf '%s\n' "$s"
+}
+lvm_size_help() {
+  cat <<EOF
+大小参数格式 (-s)
+  绝对值     100G / 500M / 2T        指定固定大小 (create/extend 均可用)
+  相对扩容   +50G / +200M             在现有基础上增加 (仅 extend)
+  百分比     100%FREE                 占满卷组剩余空间
+             50%VG                    卷组总空间的 50%
+             50%PVS                   卷组内单个 PV 空间的 50%
+  便捷写法   max / all                = 100%FREE, 一键占满剩余空间
+
+示例:
+  $PROGRAM_NAME lvm create -d /dev/sdb -v vg_data -l lv_data -s 100G -f xfs -m /data
+  $PROGRAM_NAME lvm extend -v vg_data -l lv_data -s max
+  $PROGRAM_NAME lvm extend -v vg_data -l lv_data -s +50G
+EOF
+}
+lvm_disk_is_empty() {
+  local dev=$1 devtype base holders_dir holders sig
+  [[ -b $dev ]] || { error "$dev 不是块设备"; return 1; }
+  if findmnt "$dev" >/dev/null 2>&1; then error "$dev 已挂载，拒绝操作"; return 1; fi
+  if lsblk -nro MOUNTPOINT "$dev" 2>/dev/null | grep -q '[^[:space:]]'; then
+    error "$dev 或其分区已挂载，拒绝操作"; return 1
+  fi
+  lvm_pv_exists "$dev" && { error "$dev 已是 PV"; return 1; }
+  base=$(basename "$(readlink -f "$dev" 2>/dev/null || echo "$dev")")
+  holders_dir="/sys/class/block/$base/holders"
+  if [[ -d $holders_dir ]]; then
+    holders=$(ls -A "$holders_dir" 2>/dev/null || true)
+    if [[ -n $holders ]]; then error "$dev 被占用 (holders: $holders)，可能属于 multipath/md/dm"; return 1; fi
+  fi
+  if [[ -r /proc/mdstat ]] && grep -Fq "$base" /proc/mdstat; then error "$dev 出现在 /proc/mdstat，可能属于 mdadm 阵列"; return 1; fi
+  devtype=$(lsblk -nro TYPE "$dev" 2>/dev/null | head -1)
+  if [[ $devtype == disk ]]; then
+    if lsblk -nro TYPE "$dev" 2>/dev/null | tail -n +2 | grep -q '^part$'; then
+      error "$dev 包含分区，不是空盘。如需整盘使用请先: wipefs -a $dev"; return 1
+    fi
+  fi
+  if has_cmd wipefs; then
+    if sig=$(wipefs -n -i "$dev" 2>/dev/null); then
+      :
+    elif sig=$(wipefs -n "$dev" 2>/dev/null); then
+      sig=$(printf '%s\n' "$sig" | awk 'NR==1 && $1=="DEVICE" {next} {print}')
+    else
+      if blkid "$dev" >/dev/null 2>&1; then
+        error "$dev 存在文件系统/分区表签名 (wipefs 探测失败，blkid 有结果)，不是空盘。如需清空请先: wipefs -a $dev"; return 1
+      fi
+      error "无法探测 $dev 的签名 (wipefs 失败)，拒绝当作空盘处理"; return 1
+    fi
+    sig=$(printf '%s\n' "$sig" | awk 'NF {print}')
+    if [[ -n $sig ]]; then
+      error "$dev 存在文件系统/分区表签名，不是空盘:"
+      printf '%s\n' "$sig"
+      error "如需清空请先: wipefs -a $dev"
+      return 1
+    fi
+  elif blkid "$dev" >/dev/null 2>&1; then
+    error "$dev 存在文件系统/分区表签名，不是空盘。如需清空请先: wipefs -a $dev"; return 1
+  fi
+  return 0
+}
+lvm_is_swap_dev() {
+  local dev=$1 real n
+  real=$(readlink -f "$dev" 2>/dev/null || printf '%s' "$dev")
+  while read -r n; do
+    [[ -z $n ]] && continue
+    if [[ $n == "$dev" || $n == "$real" ]]; then return 0; fi
+    if [[ $(readlink -f "$n" 2>/dev/null || true) == "$real" ]]; then return 0; fi
+  done < <(swapon --noheadings --show=NAME 2>/dev/null || true)
+  return 1
+}
+lvm_swap_off_if_needed() {
+  local dev=$1
+  lvm_is_swap_dev "$dev" || return 0
+  run swapoff "$dev" || { error "swapoff $dev 失败"; return 1; }
+  info "已关闭 swap $dev"
+}
+lvm_fstab_has_uuid() { awk -v u="UUID=$1" '$1==u {found=1} END{exit !found}' /etc/fstab; }
+lvm_fstab_has_mp()   { awk -v mp="$1" '$2==mp {found=1} END{exit !found}' /etc/fstab; }
+lvm_backup_fstab() {
+  local bak
+  [[ $LVM_FSTAB_BACKED_UP -eq 1 ]] && return 0
+  [[ -f /etc/fstab ]] || { error "/etc/fstab 不存在"; return 1; }
+  bak="/etc/fstab.bak.lvm-manager.$(date +%Y%m%d-%H%M%S)"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    info "[dry-run] 备份 /etc/fstab → $bak"
+    LVM_FSTAB_BACKED_UP=1
+    return 0
+  fi
+  cp -a /etc/fstab "$bak" || { error "备份 fstab 失败"; return 1; }
+  info "已备份 fstab → $bak"
+  LVM_FSTAB_BACKED_UP=1
+}
+lvm_add_fstab() {
+  local vg=$1 lv=$2 fs=$3 mp=$4 uuid pass
+  if [[ $DRY_RUN -eq 1 ]]; then
+    [[ $fs == xfs ]] && pass=0 || pass=2
+    info "[dry-run] 写入 /etc/fstab: UUID=<新建>  $mp  $fs  defaults  0  $pass  # lvm-manager"
+    return 0
+  fi
+  uuid=$(blkid -s UUID -o value "$(lvm_lv_dev "$vg" "$lv")" 2>/dev/null) \
+    || { warn "无法获取 UUID，跳过 fstab 写入"; return 1; }
+  if lvm_fstab_has_uuid "$uuid"; then warn "fstab 已存在该 UUID，跳过"; return 0; fi
+  if lvm_fstab_has_mp "$mp"; then warn "fstab 已存在挂载点 $mp，跳过"; return 0; fi
+  [[ $fs == xfs ]] && pass=0 || pass=2
+  lvm_backup_fstab || return 1
+  printf 'UUID=%s  %s  %s  defaults  0  %d  # lvm-manager\n' "$uuid" "$mp" "$fs" "$pass" >> /etc/fstab
+  success "已写入 /etc/fstab: UUID=$uuid → $mp"
+}
+lvm_rm_fstab_by_uuid() {
+  local uuid=$1 tmp
+  [[ -n $uuid ]] || return 0
+  if [[ $DRY_RUN -eq 1 ]]; then
+    info "[dry-run] 从 /etc/fstab 删除首字段为 UUID=$uuid 的行"
+    return 0
+  fi
+  lvm_fstab_has_uuid "$uuid" || return 0
+  lvm_backup_fstab || return 1
+  tmp=$(mktemp /etc/fstab.lvm-manager.XXXXXX) || { error "无法创建临时文件"; return 1; }
+  if ! awk -v u="UUID=$uuid" '$1==u {next} {print}' /etc/fstab > "$tmp"; then
+    rm -f "$tmp"; error "生成新 fstab 失败，原文件未改动"; return 1
+  fi
+  if [[ ! -s $tmp ]]; then
+    rm -f "$tmp"; error "生成的 fstab 为空，拒绝覆盖 /etc/fstab"; return 1
+  fi
+  chmod --reference=/etc/fstab "$tmp" 2>/dev/null || true
+  chown --reference=/etc/fstab "$tmp" 2>/dev/null || true
+  if has_cmd chcon; then chcon --reference=/etc/fstab "$tmp" 2>/dev/null || true; fi
+  if [[ -L /etc/fstab ]]; then
+    if ! cat "$tmp" > /etc/fstab; then
+      error "写入 /etc/fstab 失败。备份: /etc/fstab.bak.lvm-manager.*  临时文件: $tmp"; return 1
+    fi
+    rm -f "$tmp"; return 0
+  fi
+  if ! mv -f "$tmp" /etc/fstab; then
+    error "替换 /etc/fstab 失败，原文件未改动。临时文件: $tmp"; return 1
+  fi
+}
+lvm_print_create_leftover() {
+  local bits=() cmds=()
+  [[ $DRY_RUN -eq 1 ]] && return 0
+  [[ $LVM_CREATED_LV -eq 1 ]] && bits+=("LV $LVM_VG/$LVM_LV") && cmds+=("$PROGRAM_NAME lvm delete -v $LVM_VG -l $LVM_LV")
+  [[ $LVM_CREATED_VG -eq 1 ]] && bits+=("空 VG $LVM_VG") && cmds+=("$PROGRAM_NAME lvm delete -v $LVM_VG")
+  [[ $LVM_CREATED_PV -eq 1 ]] && bits+=("PV $LVM_DISK") && cmds+=("$PROGRAM_NAME lvm delete -d $LVM_DISK")
+  (( ${#bits[@]} == 0 )) && return 0
+  warn "本次已落地、需要手动清理: ${bits[*]}"
+  warn "清理: ${cmds[*]}"
+}
+lvm_ensure_pv_in_vg() {
+  if ! lvm_vg_exists "$LVM_VG"; then
+    lvm_disk_is_empty "$LVM_DISK" || return 1
+    lvm_confirm "将 $LVM_DISK 创建为 PV 并加入新卷组 $LVM_VG ?" || return 1
+    run pvcreate -y "$LVM_DISK" || return 1
+    [[ $DRY_RUN -eq 1 ]] || LVM_CREATED_PV=1
+    if ! run vgcreate "$LVM_VG" "$LVM_DISK"; then
+      warn "卷组创建失败，回滚: pvremove $LVM_DISK"
+      run pvremove -y "$LVM_DISK" >/dev/null 2>&1 || true
+      LVM_CREATED_PV=0
+      return 1
+    fi
+    [[ $DRY_RUN -eq 1 ]] || LVM_CREATED_VG=1
+    LVM_PLANNED_VG=1
+    return 0
+  fi
+  if lvm_pv_in_vg "$LVM_DISK" "$LVM_VG"; then info "$LVM_DISK 已在卷组 $LVM_VG 中"; return 0; fi
+  if lvm_pv_exists "$LVM_DISK"; then
+    local othervg
+    othervg=$(pvs --noheadings -o vg_name "$LVM_DISK" 2>/dev/null | awk '{print $1}' || true)
+    if [[ -n $othervg && $othervg != " " ]]; then
+      error "$LVM_DISK 属于卷组 $othervg，不能加入 $LVM_VG。请先: $PROGRAM_NAME lvm delete -d $LVM_DISK 释放该 PV"
+    else
+      error "$LVM_DISK 已是独立 PV，不能当作空盘创建。请用: $PROGRAM_NAME lvm extend -v $LVM_VG -d $LVM_DISK"
+    fi
+    return 1
+  fi
+  lvm_disk_is_empty "$LVM_DISK" || return 1
+  lvm_confirm "卷组 $LVM_VG 已存在，将 $LVM_DISK 加入 ?" || return 1
+  run pvcreate -y "$LVM_DISK" || return 1
+  [[ $DRY_RUN -eq 1 ]] || LVM_CREATED_PV=1
+  if ! run vgextend -y "$LVM_VG" "$LVM_DISK"; then
+    run pvremove -y "$LVM_DISK" >/dev/null 2>&1 || true
+    LVM_CREATED_PV=0
+    return 1
+  fi
+}
+lvm_check_lv_space() {
+  local need free
+  if [[ $LVM_SIZE == *%* || $LVM_SIZE == +* ]]; then return 0; fi
+  need=$(lvm_to_mb "$LVM_SIZE")
+  if lvm_vg_exists "$LVM_VG"; then
+    free=$(lvm_vg_free_mb_planned "$LVM_VG")
+  elif [[ $DRY_RUN -eq 1 && -n $LVM_DISK ]]; then
+    free=$(lvm_disk_size_mb "$LVM_DISK" || true)
+    info "[dry-run] 按磁盘容量估算可用空间: ${free}MB (未计入 LVM 元数据开销)"
+  else
+    free=$(lvm_vg_free_mb "$LVM_VG")
+  fi
+  if (( need > free )); then
+    error "卷组 $LVM_VG 剩余空间不足: 需要 ${need}MB, 剩余 ${free}MB"; return 1
+  fi
+  if [[ $LVM_FS == xfs && need -lt 300 ]]; then
+    error "xfs 文件系统最小需要 300MB，当前仅 ${need}MB。请加大大小，或改用 ext4 (输入 sizes 查看格式)"; return 1
+  fi
+}
+lvm_check_mount_target() {
+  [[ $LVM_MOUNT == /* ]] || { error "挂载点必须是绝对路径: $LVM_MOUNT"; return 1; }
+  [[ $LVM_MOUNT != "/" ]] || { error "禁止挂载到根目录 /"; return 1; }
+  if findmnt "$LVM_MOUNT" >/dev/null 2>&1; then error "挂载点 $LVM_MOUNT 已被占用"; return 1; fi
+  if [[ -d $LVM_MOUNT ]] && [[ -n $(ls -A "$LVM_MOUNT" 2>/dev/null) ]]; then
+    warn "挂载点 $LVM_MOUNT 已存在且非空，挂载后原内容将被暂时隐藏"
+    if [[ $LVM_MOUNT_CONFIRMED -eq 0 ]]; then
+      lvm_confirm "继续挂载到非空目录 $LVM_MOUNT ?" || return 1
+      LVM_MOUNT_CONFIRMED=1
+    fi
+  fi
+}
+lvm_create_lv_on_vg() {
+  local dev
+  lvm_require_vg "$LVM_VG" || return 1
+  lvm_lv_exists "$LVM_VG" "$LVM_LV" && { error "逻辑卷 $LVM_VG/$LVM_LV 已存在"; return 1; }
+  lvm_check_lv_space || return 1
+  lvm_check_mount_target || return 1
+  lvm_confirm "创建逻辑卷 $LVM_VG/$LVM_LV (${LVM_SIZE})，格式化为 $LVM_FS 并挂载到 $LVM_MOUNT ?" || return 1
+  if [[ $LVM_SIZE == *%* ]]; then
+    run lvcreate -y -l "$LVM_SIZE" -n "$LVM_LV" "$LVM_VG" || { lvm_print_create_leftover; return 1; }
+  else
+    run lvcreate -y -L "$LVM_SIZE" -n "$LVM_LV" "$LVM_VG" || { lvm_print_create_leftover; return 1; }
+  fi
+  [[ $DRY_RUN -eq 1 ]] || LVM_CREATED_LV=1
+  dev=$(lvm_lv_dev "$LVM_VG" "$LVM_LV")
+  if [[ $LVM_FS == xfs ]]; then
+    if ! run mkfs.xfs -f "$dev"; then
+      if run lvremove -y "$dev" >/dev/null 2>&1; then LVM_CREATED_LV=0; error "格式化失败，已删除 LV"; else error "格式化失败，且回滚删除 LV 失败，请手动清理 $dev"; fi
+      lvm_print_create_leftover
+      return 1
+    fi
+  else
+    if ! run mkfs.ext4 -F "$dev"; then
+      if run lvremove -y "$dev" >/dev/null 2>&1; then LVM_CREATED_LV=0; error "格式化失败，已删除 LV"; else error "格式化失败，且回滚删除 LV 失败，请手动清理 $dev"; fi
+      lvm_print_create_leftover
+      return 1
+    fi
+  fi
+  if [[ $DRY_RUN -eq 1 ]]; then
+    info "[dry-run] mkdir -p $LVM_MOUNT"
+    info "[dry-run] mount $dev $LVM_MOUNT"
+  else
+    mkdir -p "$LVM_MOUNT" || { error "创建挂载点 $LVM_MOUNT 失败"; lvm_print_create_leftover; return 1; }
+    if ! mount "$dev" "$LVM_MOUNT"; then
+      error "挂载失败。LV 已格式化但未写入 fstab。"
+      warn "设备: $dev  挂载点: $LVM_MOUNT"
+      lvm_print_create_leftover
+      return 1
+    fi
+  fi
+  lvm_add_fstab "$LVM_VG" "$LVM_LV" "$LVM_FS" "$LVM_MOUNT" || true
+  success "创建完成: VG=$LVM_VG / LV=$LVM_LV($LVM_SIZE) / FS=$LVM_FS / 挂载点=$LVM_MOUNT"
+}
+lvm_cmd_create_vg() {
+  if [[ -z $LVM_DISK || -z $LVM_VG ]]; then error "create-vg 参数不完整: 需要 -d -v"; lvm_usage; return 1; fi
+  lvm_valid_name "$LVM_VG" "卷组名" || return 1
+  if lvm_vg_exists "$LVM_VG"; then
+    error "卷组 $LVM_VG 已存在。若要加盘请用: $PROGRAM_NAME lvm extend -v $LVM_VG -d $LVM_DISK"; return 1
+  fi
+  lvm_ensure_pv_in_vg || return 1
+  success "卷组创建完成: $LVM_DISK → VG=$LVM_VG"
+}
+lvm_cmd_create_lv() {
+  if [[ -z $LVM_VG || -z $LVM_LV || -z $LVM_SIZE || -z $LVM_FS || -z $LVM_MOUNT ]]; then
+    error "create-lv 参数不完整: 需要 -v -l -s -f -m"; lvm_usage; return 1
+  fi
+  lvm_valid_name "$LVM_VG" "卷组名" || return 1
+  lvm_valid_name "$LVM_LV" "逻辑卷名" || return 1
+  LVM_FS=$(lvm_normalize_fs "$LVM_FS")
+  lvm_fs_tools_check "$LVM_FS" || return 1
+  LVM_SIZE=$(lvm_normalize_size "$LVM_SIZE")
+  lvm_valid_size "$LVM_SIZE" || { error "大小格式不合法: $LVM_SIZE"; lvm_size_help; return 1; }
+  [[ $LVM_SIZE != +* ]] || { error "create 不支持相对大小 (如 +50G)，请用绝对值 50G 或 max"; return 1; }
+  if ! lvm_vg_exists "$LVM_VG"; then
+    error "卷组 $LVM_VG 不存在。请先: $PROGRAM_NAME lvm create-vg -d <磁盘> -v $LVM_VG"; return 1
+  fi
+  lvm_create_lv_on_vg
+}
+lvm_cmd_create() {
+  if [[ -z $LVM_DISK || -z $LVM_VG || -z $LVM_LV || -z $LVM_SIZE || -z $LVM_FS || -z $LVM_MOUNT ]]; then
+    error "create 参数不完整: 需要 -d -v -l -s -f -m"
+    info "只建卷组: $PROGRAM_NAME lvm create-vg -d <磁盘> -v <卷组>"
+    info "已有卷组上建 LV: $PROGRAM_NAME lvm create-lv -v <卷组> -l <逻辑卷> -s <大小> -f <fs> -m <挂载点>"
+    lvm_usage
+    return 1
+  fi
+  lvm_valid_name "$LVM_VG" "卷组名" || return 1
+  lvm_valid_name "$LVM_LV" "逻辑卷名" || return 1
+  LVM_FS=$(lvm_normalize_fs "$LVM_FS")
+  lvm_fs_tools_check "$LVM_FS" || return 1
+  LVM_SIZE=$(lvm_normalize_size "$LVM_SIZE")
+  lvm_valid_size "$LVM_SIZE" || { error "大小格式不合法: $LVM_SIZE"; lvm_size_help; return 1; }
+  [[ $LVM_SIZE != +* ]] || { error "create 不支持相对大小 (如 +50G)，请用绝对值 50G 或 max"; return 1; }
+  lvm_check_mount_target || return 1
+  lvm_ensure_pv_in_vg || return 1
+  lvm_create_lv_on_vg || return 1
+}
+lvm_cmd_create_pv() {
+  [[ -n $LVM_DISK ]] || { error "create-pv 需要 -d 指定设备"; lvm_usage; return 1; }
+  [[ -b $LVM_DISK ]] || { error "$LVM_DISK 不是块设备"; return 1; }
+  lvm_disk_is_empty "$LVM_DISK" || return 1
+  lvm_confirm "将 $LVM_DISK 初始化为 PV ?" || { warn "用户取消操作。"; return "$CANCEL_RC"; }
+  run pvcreate -y "$LVM_DISK" || return 1
+  success "已创建 PV: $LVM_DISK"
+}
+lvm_grow_fs() {
+  local vg=$1 lv=$2 fstype mp
+  local dev
+  dev=$(lvm_lv_dev "$vg" "$lv")
+  if [[ $DRY_RUN -eq 1 ]]; then
+    fstype=$(blkid -s TYPE -o value "$dev" 2>/dev/null || echo "${LVM_FS:-未知}")
+    case $fstype in
+      xfs)
+        mp=$(findmnt -n -o TARGET "$dev" 2>/dev/null || true)
+        info "[dry-run] xfs_growfs ${mp:-(需在挂载状态下扩容)}" ;;
+      ext4) info "[dry-run] resize2fs $dev" ;;
+      *)    info "[dry-run] 扩容文件系统 ($fstype)" ;;
+    esac
+    return 0
+  fi
+  fstype=$(blkid -s TYPE -o value "$dev" 2>/dev/null || true)
+  case $fstype in
+    xfs)
+      mp=$(findmnt -n -o TARGET "$dev" 2>/dev/null || true)
+      [[ -n $mp ]] || { error "xfs 扩容需在挂载状态进行，$dev 未挂载"; return 1; }
+      xfs_growfs "$mp" || return 1 ;;
+    ext4)
+      resize2fs "$dev" || return 1 ;;
+    *)
+      warn "未知文件系统 '$fstype'，跳过文件系统扩容 (LV 已扩容)" ;;
+  esac
+}
+lvm_cmd_extend() {
+  [[ -n $LVM_VG ]] || { error "extend 需要 -v 指定卷组"; lvm_usage; return 1; }
+  [[ -n $LVM_DISK || -n $LVM_LV ]] || { error "extend 需要 -d 加盘 或 -l/-s 扩容 LV"; lvm_usage; return 1; }
+  lvm_valid_name "$LVM_VG" "卷组名" || return 1
+  [[ -z $LVM_LV ]] || lvm_valid_name "$LVM_LV" "逻辑卷名" || return 1
+  if [[ -n $LVM_SIZE ]]; then
+    LVM_SIZE=$(lvm_normalize_size "$LVM_SIZE")
+    lvm_valid_size "$LVM_SIZE" || { error "大小格式不合法: $LVM_SIZE"; lvm_size_help; return 1; }
+  fi
+  lvm_vg_exists "$LVM_VG" || { error "卷组 $LVM_VG 不存在"; return 1; }
+  if [[ -n $LVM_DISK ]]; then
+    if lvm_pv_exists "$LVM_DISK"; then
+      if lvm_pv_in_vg "$LVM_DISK" "$LVM_VG"; then
+        info "$LVM_DISK 已在卷组 $LVM_VG 中，跳过加盘"
+      else
+        local othervg
+        othervg=$(pvs --noheadings -o vg_name "$LVM_DISK" 2>/dev/null | awk '{print $1}' || true)
+        if [[ -n $othervg && $othervg != " " ]]; then
+          error "$LVM_DISK 属于卷组 $othervg，不能加入 $LVM_VG。请先: $PROGRAM_NAME lvm delete -d $LVM_DISK 释放该 PV"
+          return 1
+        fi
+        lvm_confirm "将已存在的 PV $LVM_DISK 加入卷组 $LVM_VG ?" || return 1
+        run vgextend -y "$LVM_VG" "$LVM_DISK" || return 1
+        success "已将 $LVM_DISK 加入卷组 $LVM_VG"
+      fi
+    else
+      lvm_disk_is_empty "$LVM_DISK" || return 1
+      lvm_confirm "创建 PV 并把 $LVM_DISK 加入卷组 $LVM_VG ?" || return 1
+      run pvcreate -y "$LVM_DISK" || return 1
+      if ! run vgextend -y "$LVM_VG" "$LVM_DISK"; then
+        run pvremove -y "$LVM_DISK" >/dev/null 2>&1 || true
+        return 1
+      fi
+      success "已将 $LVM_DISK 加入卷组 $LVM_VG"
+    fi
+  fi
+  if [[ -n $LVM_LV ]]; then
+    [[ -n $LVM_SIZE ]] || { error "扩容 LV 需要 -s 指定大小"; lvm_size_help; return 1; }
+    lvm_lv_exists "$LVM_VG" "$LVM_LV" || { error "逻辑卷 $LVM_VG/$LVM_LV 不存在"; return 1; }
+    local fstype dev
+    dev=$(lvm_lv_dev "$LVM_VG" "$LVM_LV")
+    fstype=$(blkid -s TYPE -o value "$dev" 2>/dev/null || true)
+    case $fstype in
+      xfs|ext4) lvm_fs_tools_check "$fstype" || return 1 ;;
+      *) warn "文件系统 '$fstype' 非 xfs/ext4，将仅扩容 LV，不扩容文件系统" ;;
+    esac
+    if [[ $LVM_SIZE != +* && $LVM_SIZE != *%* ]]; then
+      local cur target need free
+      cur=$(lvm_lv_size_mb "$LVM_VG" "$LVM_LV"); target=$(lvm_to_mb "$LVM_SIZE")
+      if (( target <= cur )); then error "目标大小 ${LVM_SIZE} 不大于当前大小，拒绝操作 (本工具不支持缩小)"; return 1; fi
+      need=$(( target - cur )); free=$(lvm_vg_free_mb_planned "$LVM_VG")
+      if (( need > free )); then error "卷组 $LVM_VG 剩余空间不足: 需要 ${need}MB, 剩余 ${free}MB"; return 1; fi
+    fi
+    lvm_confirm "扩容逻辑卷 $LVM_VG/$LVM_LV → ${LVM_SIZE}，并同步扩容文件系统 ?" || return 1
+    if [[ $LVM_SIZE == *%* ]]; then
+      run lvextend -y -l "$LVM_SIZE" "$dev" || return 1
+    else
+      run lvextend -y -L "$LVM_SIZE" "$dev" || return 1
+    fi
+    lvm_grow_fs "$LVM_VG" "$LVM_LV" || return 1
+    success "扩容完成: $LVM_VG/$LVM_LV → ${LVM_SIZE} (文件系统: ${fstype:-未知})"
+  fi
+}
+lvm_delete_lv() {
+  local vg=$1 lv=$2 mp uuid is_swap=0
+  local dev
+  lvm_lv_exists "$vg" "$lv" || { error "逻辑卷 $vg/$lv 不存在"; return 1; }
+  dev=$(lvm_lv_dev "$vg" "$lv")
+  if [[ ! -e $dev ]]; then
+    warn "$dev 设备节点不存在 (LV 未激活)，先激活以读取信息"
+    run lvchange -ay "$vg/$lv" || { error "激活 $vg/$lv 失败"; return 1; }
+    dev=$(lvm_lv_dev "$vg" "$lv")
+  fi
+  if lvm_is_swap_dev "$dev"; then is_swap=1; fi
+  mp=$(findmnt -n -o TARGET "$dev" 2>/dev/null || true)
+  uuid=$(blkid -s UUID -o value "$dev" 2>/dev/null || true)
+  [[ $is_swap -eq 1 ]] && info "检测到 $dev 正在作为 swap 使用，确认后将先关闭"
+  [[ -n $mp ]] && info "检测到 $dev 已挂载到 $mp，确认后将先卸载"
+  if [[ -n $uuid ]] && lvm_fstab_has_uuid "$uuid"; then
+    info "确认后将同步删除 /etc/fstab 中 UUID=$uuid 的条目"
+  elif [[ $DRY_RUN -eq 1 ]]; then
+    info "[dry-run] 若 fstab 中有该 LV 的 UUID 条目将一并删除"
+  fi
+  lvm_confirm_danger "确认删除逻辑卷 $dev 及其所有数据?" || return 1
+  if [[ $is_swap -eq 1 ]]; then lvm_swap_off_if_needed "$dev" || return 1; fi
+  if [[ -n $mp ]]; then
+    if [[ $DRY_RUN -eq 1 ]]; then info "[dry-run] umount $mp"; else umount "$mp" || { error "卸载 $mp 失败"; return 1; }; fi
+  fi
+  if [[ -n $uuid ]] && lvm_fstab_has_uuid "$uuid"; then lvm_rm_fstab_by_uuid "$uuid" || return 1; fi
+  run lvremove -y "$dev" || return 1
+  success "已删除逻辑卷 $dev"
+}
+lvm_delete_vg() {
+  local vg=$1 lvs_list pvs_list l
+  lvm_vg_exists "$vg" || { error "卷组 $vg 不存在"; return 1; }
+  lvs_list=$(lvs --noheadings -o lv_name "$vg" 2>/dev/null | awk '{print $1}' || true)
+  if [[ -n $lvs_list ]]; then
+    warn "卷组 $vg 包含以下逻辑卷:"
+    echo "$lvs_list" | sed 's/^/    - /'
+    lvm_confirm "将删除卷组中所有逻辑卷及其数据，继续 ?" || return 1
+    for l in $lvs_list; do lvm_delete_lv "$vg" "$l" || return 1; done
+  fi
+  pvs_list=$(pvs --noheadings -o pv_name,vg_name 2>/dev/null | awk -v vg="$vg" '$2==vg {print $1}' || true)
+  lvm_confirm_danger "确认删除卷组 $vg ?" || return 1
+  run vgremove -y "$vg" || return 1
+  success "已删除卷组 $vg (PV: $pvs_list 仍保留为独立 PV)"
+}
+lvm_delete_pv() {
+  local dev=$1 vgname
+  [[ -b $dev ]] || { error "$dev 不是块设备"; return 1; }
+  lvm_pv_exists "$dev" || { error "$dev 不是 PV"; return 1; }
+  vgname=$(pvs --noheadings -o vg_name "$dev" 2>/dev/null | awk '{print $1}' || true)
+  if [[ -n $vgname && $vgname != " " ]]; then
+    warn "$dev 属于卷组 $vgname，将从卷组中移除"
+    lvm_confirm_danger "确认将 $dev 从卷组 $vgname 移除 ?" || return 1
+    if ! run vgreduce -y "$vgname" "$dev"; then
+      error "移除失败: 若 PV 上仍有数据，请先 pvmove 迁移；若这是卷组最后一块盘，请先: $PROGRAM_NAME lvm delete -v $vgname"
+      return 1
+    fi
+  fi
+  lvm_confirm_danger "确认删除 PV $dev ?" || return 1
+  run pvremove -y "$dev" || return 1
+  success "已删除 PV $dev"
+}
+lvm_cmd_delete() {
+  if [[ -n $LVM_LV ]]; then
+    [[ -n $LVM_VG ]] || { error "删除 LV 需要 -v 指定卷组"; return 1; }
+    lvm_valid_name "$LVM_VG" "卷组名" || return 1
+    lvm_valid_name "$LVM_LV" "逻辑卷名" || return 1
+    lvm_delete_lv "$LVM_VG" "$LVM_LV"
+  elif [[ -n $LVM_DISK ]]; then
+    lvm_delete_pv "$LVM_DISK"
+  elif [[ -n $LVM_VG ]]; then
+    lvm_valid_name "$LVM_VG" "卷组名" || return 1
+    lvm_delete_vg "$LVM_VG"
+  else
+    error "delete 需要指定对象: -v 卷组 / -l 逻辑卷 / -d 磁盘"
+    lvm_usage
+    return 1
+  fi
+}
+lvm_cmd_list() {
+  local what=${1:-all}
+  case $what in
+    pvs) info "物理卷 (PV):"; pvs || true ;;
+    vgs) info "卷组 (VG):"; vgs || true ;;
+    lvs) info "逻辑卷 (LV):"; lvs || true ;;
+    disk) info "磁盘视图:"; lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT || true ;;
+    all)
+      info "物理卷 (PV):"; pvs || true
+      info "卷组 (VG):"; vgs || true
+      info "逻辑卷 (LV):"; lvs || true
+      info "磁盘视图:"; lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT || true ;;
+    *) error "未知查询类型: $what (可选 pvs/vgs/lvs/disk/all)"; return 1 ;;
+  esac
+}
+lvm_cmd_info() {
+  [[ -n $LVM_DISK ]] || { error "info 需要 -d 指定设备"; lvm_usage; return 1; }
+  [[ -b $LVM_DISK ]] || { error "$LVM_DISK 不是块设备"; return 1; }
+  info "设备信息: $LVM_DISK"
+  lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT "$LVM_DISK" || true
+  if lvm_pv_exists "$LVM_DISK"; then
+    info "PV 状态:"; pvs "$LVM_DISK" || true
+  else
+    warn "$LVM_DISK 当前不是 PV (空盘可用于 create)"
+  fi
+}
+lvm_print_brief_status() {
+  local vgs_line lvs_line
+  vgs_line=$(vgs --noheadings -o vg_name,vg_size,vg_free 2>/dev/null \
+    | awk '{printf "%s(size %s, free %s)  ", $1,$2,$3}' || true)
+  lvs_line=$(lvs --noheadings -o vg_name,lv_name,lv_size 2>/dev/null \
+    | awk '{printf "%s/%s(%s)  ", $1,$2,$3}' || true)
+  info "当前 VG: ${vgs_line:-无}"
+  info "当前 LV: ${lvs_line:-无}"
+}
+lvm_parse_opts() {
+  LVM_DISK=""; LVM_VG=""; LVM_LV=""; LVM_SIZE=""; LVM_FS=""; LVM_MOUNT=""
+  LVM_POS=()
+  LVM_FSTAB_BACKED_UP=0; LVM_PLANNED_VG=0; LVM_CREATED_PV=0; LVM_CREATED_VG=0; LVM_CREATED_LV=0; LVM_MOUNT_CONFIRMED=0
+  local opt
+  OPTIND=1
+  while getopts ":d:v:l:s:f:m:ynh" opt; do
+    case $opt in
+      d) LVM_DISK=$OPTARG ;;
+      v) LVM_VG=$OPTARG ;;
+      l) LVM_LV=$OPTARG ;;
+      s) LVM_SIZE=$OPTARG ;;
+      f) LVM_FS=$OPTARG ;;
+      m) LVM_MOUNT=$OPTARG ;;
+      y) ASSUME_YES=1 ;;
+      n) DRY_RUN=1 ;;
+      h) lvm_usage; exit 0 ;;
+      :) error "选项 -$OPTARG 缺少参数"; lvm_usage; return 1 ;;
+      *) error "未知选项 -$OPTARG"; lvm_usage; return 1 ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+  LVM_POS=("$@")
+}
+lvm_usage() { cat <<EOF
+LVM 管理 (增 / 删 / 查 / 扩容) — 融合自 lvm-manager.sh
+
+用法:
+  $PROGRAM_NAME lvm create -d <磁盘> -v <卷组> -l <逻辑卷> -s <大小> -f <xfs|ext4> -m <挂载点>
+  $PROGRAM_NAME lvm create-vg -d <磁盘> -v <卷组>          # 只建 PV + VG
+  $PROGRAM_NAME lvm create-lv -v <卷组> -l <逻辑卷> -s <大小> -f <xfs|ext4> -m <挂载点>
+  $PROGRAM_NAME lvm create-pv -d <磁盘>                   # 只建 PV
+  $PROGRAM_NAME lvm extend -v <卷组> [-d <磁盘>] [-l <逻辑卷> -s <大小>]
+  $PROGRAM_NAME lvm delete -v <卷组> [-l <逻辑卷>]        # 删 LV；只给 -v 则删整个 VG
+  $PROGRAM_NAME lvm delete -d <磁盘>                      # 删 PV
+  $PROGRAM_NAME lvm list [pvs|vgs|lvs|disk|all]           # 查询
+  $PROGRAM_NAME lvm info -d <磁盘>                        # 查看单块磁盘
+  $PROGRAM_NAME lvm sizes                                 # 大小格式说明
+
+选项:
+  -d <设备>      磁盘设备, 如 /dev/sdb
+  -v <卷组>      卷组名, 如 vg_data
+  -l <逻辑卷>    逻辑卷名, 如 lv_data
+  -s <大小>      如 100G / +50G / 100%FREE / max(占满剩余空间)
+  -f <文件系统>  xfs 或 ext4
+  -m <挂载点>    如 /data
+  -y, --yes      跳过所有确认 (危险操作请谨慎)
+  -n, --dry-run  只打印将执行的操作，不改动系统
+
+示例:
+  $PROGRAM_NAME --dry-run lvm create -d /dev/sdb -v vg_data -l lv_data -s 100G -f xfs -m /data
+  $PROGRAM_NAME lvm create-vg -d /dev/sdb -v vg_data
+  $PROGRAM_NAME lvm create-lv -v vg_data -l lv_data -s 100G -f ext4 -m /data
+  $PROGRAM_NAME lvm extend -v vg_data -d /dev/sdc
+  $PROGRAM_NAME lvm extend -v vg_data -l lv_data -s +50G
+  $PROGRAM_NAME lvm delete -v vg_data -l lv_data
+  $PROGRAM_NAME lvm delete -v vg_data
+  $PROGRAM_NAME lvm delete -d /dev/sdc
+EOF
+}
+lvm_main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    ""|help|-h|--help) lvm_usage; return 0 ;;
+    list|ls) lvm_parse_opts "$@"; lvm_cmd_list "${LVM_POS[0]:-all}" ;;
+    info) lvm_parse_opts "$@"; lvm_cmd_info ;;
+    install) ensure_lvm ;;
+    sizes|size-help) lvm_size_help ;;
+    create|create-vg|create-lv|create-pv|extend|delete|rm)
+      lvm_parse_opts "$@"; lvm_check_deps || return 1
+      case "$cmd" in
+        create) lvm_cmd_create ;;
+        create-vg) lvm_cmd_create_vg ;;
+        create-lv) lvm_cmd_create_lv ;;
+        create-pv) lvm_cmd_create_pv ;;
+        extend) lvm_cmd_extend ;;
+        delete|rm) lvm_cmd_delete ;;
+      esac ;;
+    *) error "未知 lvm 动作：${cmd}。支持：create/create-vg/create-lv/create-pv/extend/delete/list/info/sizes/install/help" ; lvm_usage; return 1 ;;
+  esac
+}
+# ---- LVM 交互菜单 (菜单调用) ----
+lvm_menu_create() {
+  echo -n "磁盘设备 (如 /dev/sdb): "; read -r LVM_DISK
+  echo -n "卷组名 (默认 vg_data): "; read -r LVM_VG; LVM_VG=${LVM_VG:-vg_data}
+  echo -n "逻辑卷名 (默认 lv_data): "; read -r LVM_LV; LVM_LV=${LVM_LV:-lv_data}
+  echo "大小可选: 100G / 500M / 100%FREE / max (输入 ? 查看全部格式)"
+  echo -n "逻辑卷大小 (如 100G, 100%FREE, max): "; read -r LVM_SIZE
+  if [[ $LVM_SIZE == "?" ]]; then lvm_size_help; echo -n "逻辑卷大小: "; read -r LVM_SIZE; fi
+  echo -n "文件系统 (xfs/ext4, 默认 xfs): "; read -r LVM_FS; LVM_FS=${LVM_FS:-xfs}
+  echo -n "挂载点 (如 /data): "; read -r LVM_MOUNT
+  lvm_check_deps || return 1
+  lvm_cmd_create
+}
+lvm_menu_create_vg() {
+  echo -n "磁盘设备 (如 /dev/sdb): "; read -r LVM_DISK
+  echo -n "卷组名 (默认 vg_data): "; read -r LVM_VG; LVM_VG=${LVM_VG:-vg_data}
+  lvm_check_deps || return 1
+  lvm_cmd_create_vg
+}
+lvm_menu_create_lv() {
+  echo -n "卷组名: "; read -r LVM_VG
+  echo -n "逻辑卷名 (默认 lv_data): "; read -r LVM_LV; LVM_LV=${LVM_LV:-lv_data}
+  echo "大小可选: 100G / 500M / 100%FREE / max (输入 ? 查看全部格式)"
+  echo -n "逻辑卷大小: "; read -r LVM_SIZE
+  if [[ $LVM_SIZE == "?" ]]; then lvm_size_help; echo -n "逻辑卷大小: "; read -r LVM_SIZE; fi
+  echo -n "文件系统 (xfs/ext4, 默认 xfs): "; read -r LVM_FS; LVM_FS=${LVM_FS:-xfs}
+  echo -n "挂载点 (如 /data): "; read -r LVM_MOUNT
+  lvm_check_deps || return 1
+  lvm_cmd_create_lv
+}
+lvm_menu_extend() {
+  lvm_print_brief_status
+  echo -n "卷组名 (如 vg_data): "; read -r LVM_VG
+  echo -n "要加入的磁盘 (如 /dev/sdc, 留空跳过): "; read -r LVM_DISK
+  echo -n "要扩容的 LV 名 (如 lv_data, 留空跳过): "; read -r LVM_LV
+  if [[ -n $LVM_LV ]]; then
+    echo "大小可选: +50G / 100%FREE / max / 100G (输入 ? 查看全部格式)"
+    echo -n "扩容大小 (如 +50G, 100%FREE, max): "; read -r LVM_SIZE
+    if [[ $LVM_SIZE == "?" ]]; then lvm_size_help; echo -n "扩容大小: "; read -r LVM_SIZE; fi
+  fi
+  lvm_check_deps || return 1
+  lvm_cmd_extend
+}
+lvm_menu_delete() {
+  local t
+  lvm_print_brief_status
+  echo "  1) 删除逻辑卷 LV"
+  echo "  2) 删除卷组 VG (含其中所有 LV)"
+  echo "  3) 删除物理卷 PV"
+  echo -n "选择: "; read -r t
+  case $t in
+    1) echo -n "卷组名: "; read -r LVM_VG; echo -n "逻辑卷名: "; read -r LVM_LV; lvm_cmd_delete ;;
+    2) echo -n "卷组名: "; read -r LVM_VG; lvm_cmd_delete ;;
+    3) echo -n "磁盘设备 (如 /dev/sdc): "; read -r LVM_DISK; lvm_cmd_delete ;;
+    *) warn "无效选择" ;;
+  esac
+}
+lvm_menu_list() {
+  echo "  可选: pvs=物理卷  vgs=卷组  lvs=逻辑卷  disk=磁盘  all=全部"
+  echo -n "选择 (默认 all): "; read -r w
+  lvm_cmd_list "${w:-all}"
+}
+lvm_menu_info() {
+  echo -n "磁盘设备 (如 /dev/sdb): "; read -r LVM_DISK
+  lvm_cmd_info
+}
 ensure_perf_tools() { is_macos && { has_cmd htop || brew_install htop || true; return 0; }; case "$PKG_MANAGER" in apt) pkg_install sysstat htop lsof iotop iftop nload iproute2 procps ;; dnf|yum) pkg_install sysstat htop lsof iotop iftop nload iproute procps-ng ;; pacman) pkg_install sysstat htop lsof iotop iftop nload iproute2 procps-ng ;; *) warn "无法自动安装性能工具。" ;; esac; }
 perf_quick() { ensure_perf_tools; echo "========== 系统信息 =========="; print_env; echo; echo "========== 负载 =========="; uptime || true; echo; echo "========== 内存 =========="; free -h 2>/dev/null || vm_stat 2>/dev/null || true; echo; echo "========== 磁盘 =========="; df -hT 2>/dev/null || df -h || true; echo; echo "========== 网络 =========="; has_cmd ss && ss -s || netstat -ib 2>/dev/null | head -n 20 || true; echo; echo "========== Top 进程 =========="; ps aux --sort=-%cpu 2>/dev/null | head -n 10 || ps aux | head -n 10 || true; }
 
@@ -893,16 +1689,18 @@ EOF_MENU
 read -r -p "选择: " c; case "${c:-}" in 1) menu_action "查看 Swap" swap_list ;; 2) menu_action "增加 Swap 文件" swap_add ;; 3) menu_action "调整 Swap 文件大小" swap_resize ;; 4) menu_action "删除 Swap" swap_delete ;; 0) return ;; *) menu_invalid ;; esac; done; }
 menu_lvm() { local c; while true; do menu_clear; cat <<'EOF_MENU'
 [LVM]
-1) 查看 PV/VG/LV/块设备
-2) 安装 lvm2
-3) 创建 PV
-4) 创建 VG
-5) 创建 LV
-6) 扩容 LV
-7) 删除 LV
+1) 完整创建（空盘 → PV/VG/LV → 格式化/挂载/fstab）
+2) 仅创建卷组 VG
+3) 仅创建逻辑卷 LV
+4) 扩容（VG 加盘 / LV + 文件系统扩容）
+5) 删除（LV / VG / PV）
+6) 查询（PV / VG / LV / 磁盘）
+7) 磁盘信息
+8) 大小格式帮助
+9) 安装 lvm2
 0) 返回上一级
 EOF_MENU
-read -r -p "选择: " c; case "${c:-}" in 1) menu_action "查看 PV/VG/LV/块设备" lvm_list ;; 2) menu_action "安装 lvm2" ensure_lvm ;; 3) menu_action "创建 PV" lvm_create_pv ;; 4) menu_action "创建 VG" lvm_create_vg ;; 5) menu_action "创建 LV" lvm_create_lv ;; 6) menu_action "扩容 LV" lvm_extend_lv ;; 7) menu_action "删除 LV" lvm_remove_lv ;; 0) return ;; *) menu_invalid ;; esac; done; }
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "LVM 完整创建" lvm_menu_create ;; 2) menu_action "创建卷组 VG" lvm_menu_create_vg ;; 3) menu_action "创建逻辑卷 LV" lvm_menu_create_lv ;; 4) menu_action "LVM 扩容" lvm_menu_extend ;; 5) menu_action "LVM 删除" lvm_menu_delete ;; 6) menu_action "LVM 查询" lvm_menu_list ;; 7) menu_action "磁盘信息" lvm_menu_info ;; 8) lvm_size_help; menu_pause ;; 9) menu_action "安装 lvm2" ensure_lvm ;; 0) return ;; *) menu_invalid ;; esac; done; }
 menu_perf() { local c; while true; do menu_clear; cat <<'EOF_MENU'
 [Linux/macOS 性能瓶颈排查]
 1) 快速巡检
@@ -990,7 +1788,17 @@ usage() { cat <<EOF_USAGE
   $PROGRAM_NAME docker-offline uninstall
   $PROGRAM_NAME firewall status
   $PROGRAM_NAME swap add --size 4G --path /swapfile
-  $PROGRAM_NAME lvm list
+  $PROGRAM_NAME lvm list [pvs|vgs|lvs|disk|all]
+  $PROGRAM_NAME lvm info -d /dev/sdb
+  $PROGRAM_NAME lvm create -d /dev/sdb -v vg_data -l lv_data -s 100G -f xfs -m /data
+  $PROGRAM_NAME lvm create-vg -d /dev/sdb -v vg_data
+  $PROGRAM_NAME lvm create-lv -v vg_data -l lv_data -s 100G -f ext4 -m /data
+  $PROGRAM_NAME lvm extend -v vg_data -d /dev/sdc
+  $PROGRAM_NAME lvm extend -v vg_data -l lv_data -s +50G
+  $PROGRAM_NAME lvm delete -v vg_data -l lv_data
+  $PROGRAM_NAME lvm delete -v vg_data
+  $PROGRAM_NAME lvm delete -d /dev/sdc
+  $PROGRAM_NAME lvm sizes
   $PROGRAM_NAME perf quick
   $PROGRAM_NAME service list
   $PROGRAM_NAME service status <服务名>
@@ -1009,7 +1817,7 @@ usage() { cat <<EOF_USAGE
 EOF_USAGE
 }
 get_opt_value() { local key="$1" arg next; shift || true; while [[ "$#" -gt 0 ]]; do arg="$1"; case "$arg" in "$key") shift || true; next="${1:-}"; [[ -n "$next" ]] || return 1; printf '%s' "$next"; return 0 ;; "$key"=*) printf '%s' "${arg#*=}"; return 0 ;; esac; shift || true; done; return 1; }
-main() { detect_os; load_config; audit_log "START: $0 $*"; while [[ "$#" -gt 0 ]]; do case "${1:-}" in -y|--yes) ASSUME_YES=1; shift ;; -n|--dry-run) DRY_RUN=1; shift ;; --no-color) NO_COLOR=1; shift ;; -h|--help) usage; exit 0 ;; *) break ;; esac; done; local module="${1:-menu}" action="${2:-}"; case "$module" in menu|"") require_root "$@"; main_menu ;; env) print_env ;; tools) require_root "$@"; case "${action:-}" in install) install_common_tools ;; status) tool_status ;; config) case "${3:-all}" in all) configure_common_tools ;; vim) configure_vim ;; tmux) configure_tmux ;; git) configure_git ;; zsh-basic) configure_zsh_basic ;; *) fatal "未知 tools config 动作：${3:-}" ;; esac ;; oh-my-zsh) install_oh_my_zsh "$(get_opt_value --github-proxy "$@" || true)" ;; zsh-plugins) install_zsh_plugins "$(get_opt_value --github-proxy "$@" || true)" ;; install-z) install_rupa_z "$(get_opt_value --github-proxy "$@" || true)" ;; zsh-full) configure_zsh_full ;; chsh-zsh) change_default_shell_to_zsh ;; *) fatal "未知 tools 动作：${action:-}" ;; esac ;; mirror) require_root "$@"; case "${action:-}" in backup) backup_sources ;; set) set_system_mirror "$(get_opt_value --source "$@" || printf '%s' "$DEFAULT_SOURCE")" ;; list-backups) list_source_backups ;; restore) restore_sources "${3:-}" ;; refresh) refresh_pkg_cache ;; *) fatal "未知 mirror 动作：${action:-}" ;; esac ;; docker) require_root "$@"; case "${action:-}" in install) install_docker "$(get_opt_value --source "$@" || printf '%s' "$DEFAULT_DOCKER_SOURCE")" ;; mirror) configure_docker_registry_mirror "$(get_opt_value --registry "$@" || true)" ;; save-images) save_docker_images_one_by_one "$(get_opt_value --dir "$@" || true)" ;; status) menu_docker_status ;; uninstall) uninstall_docker "$(get_opt_value --remove-data "$@" || printf '0')" ;; *) fatal "未知 docker 动作：${action:-}" ;; esac ;; firewall) require_root "$@"; case "${action:-}" in install) install_firewall ;; status) firewall_status ;; enable) firewall_enable ;; disable) firewall_disable ;; allow) firewall_allow "${3:-}" ;; deny) firewall_deny "${3:-}" ;; uninstall) uninstall_firewall ;; *) fatal "未知 firewall 动作：${action:-}" ;; esac ;; swap) require_root "$@"; case "${action:-}" in list) swap_list ;; add) swap_add "$(get_opt_value --size "$@" || true)" "$(get_opt_value --path "$@" || printf '/swapfile')" ;; resize) swap_resize "$(get_opt_value --size "$@" || true)" "$(get_opt_value --path "$@" || printf '/swapfile')" ;; delete) swap_delete "$(get_opt_value --path "$@" || true)" ;; *) fatal "未知 swap 动作：${action:-}" ;; esac ;; lvm) require_root "$@"; case "${action:-}" in list) lvm_list ;; install) ensure_lvm ;; create-pv) lvm_create_pv "${3:-}" ;; create-vg) shift 2; lvm_create_vg "$@" ;; create-lv) lvm_create_lv "${3:-}" "${4:-}" "${5:-}" ;; extend-lv) lvm_extend_lv "${3:-}" "${4:-}" ;; remove-lv) lvm_remove_lv "${3:-}" ;; *) fatal "未知 lvm 动作：${action:-}" ;; esac ;; perf) case "${action:-quick}" in quick) perf_quick ;; install-tools) ensure_perf_tools ;; *) fatal "未知 perf 动作：${action:-}" ;; esac ;; docker-offline) require_root "$@"; shift 2; case "${action:-}" in help) cat <<'EOF_OFFLINE_HELP'
+main() { detect_os; load_config; audit_log "START: $0 $*"; while [[ "$#" -gt 0 ]]; do case "${1:-}" in -y|--yes) ASSUME_YES=1; shift ;; -n|--dry-run) DRY_RUN=1; shift ;; --no-color) NO_COLOR=1; shift ;; -h|--help) usage; exit 0 ;; *) break ;; esac; done; local module="${1:-menu}" action="${2:-}"; case "$module" in menu|"") require_root "$@"; main_menu ;; env) print_env ;; tools) require_root "$@"; case "${action:-}" in install) install_common_tools ;; status) tool_status ;; config) case "${3:-all}" in all) configure_common_tools ;; vim) configure_vim ;; tmux) configure_tmux ;; git) configure_git ;; zsh-basic) configure_zsh_basic ;; *) fatal "未知 tools config 动作：${3:-}" ;; esac ;; oh-my-zsh) install_oh_my_zsh "$(get_opt_value --github-proxy "$@" || true)" ;; zsh-plugins) install_zsh_plugins "$(get_opt_value --github-proxy "$@" || true)" ;; install-z) install_rupa_z "$(get_opt_value --github-proxy "$@" || true)" ;; zsh-full) configure_zsh_full ;; chsh-zsh) change_default_shell_to_zsh ;; *) fatal "未知 tools 动作：${action:-}" ;; esac ;; mirror) require_root "$@"; case "${action:-}" in backup) backup_sources ;; set) set_system_mirror "$(get_opt_value --source "$@" || printf '%s' "$DEFAULT_SOURCE")" ;; list-backups) list_source_backups ;; restore) restore_sources "${3:-}" ;; refresh) refresh_pkg_cache ;; *) fatal "未知 mirror 动作：${action:-}" ;; esac ;; docker) require_root "$@"; case "${action:-}" in install) install_docker "$(get_opt_value --source "$@" || printf '%s' "$DEFAULT_DOCKER_SOURCE")" ;; mirror) configure_docker_registry_mirror "$(get_opt_value --registry "$@" || true)" ;; save-images) save_docker_images_one_by_one "$(get_opt_value --dir "$@" || true)" ;; status) menu_docker_status ;; uninstall) uninstall_docker "$(get_opt_value --remove-data "$@" || printf '0')" ;; *) fatal "未知 docker 动作：${action:-}" ;; esac ;; firewall) require_root "$@"; case "${action:-}" in install) install_firewall ;; status) firewall_status ;; enable) firewall_enable ;; disable) firewall_disable ;; allow) firewall_allow "${3:-}" ;; deny) firewall_deny "${3:-}" ;; uninstall) uninstall_firewall ;; *) fatal "未知 firewall 动作：${action:-}" ;; esac ;; swap) require_root "$@"; case "${action:-}" in list) swap_list ;; add) swap_add "$(get_opt_value --size "$@" || true)" "$(get_opt_value --path "$@" || printf '/swapfile')" ;; resize) swap_resize "$(get_opt_value --size "$@" || true)" "$(get_opt_value --path "$@" || printf '/swapfile')" ;; delete) swap_delete "$(get_opt_value --path "$@" || true)" ;; *) fatal "未知 swap 动作：${action:-}" ;; esac ;; lvm) require_root "$@"; lvm_main "${@:2}" ;; perf) case "${action:-quick}" in quick) perf_quick ;; install-tools) ensure_perf_tools ;; *) fatal "未知 perf 动作：${action:-}" ;; esac ;; docker-offline) require_root "$@"; shift 2; case "${action:-}" in help) cat <<'EOF_OFFLINE_HELP'
 docker-offline 模块：离线二进制安装 Docker Engine + Docker Compose
 
 动作：
