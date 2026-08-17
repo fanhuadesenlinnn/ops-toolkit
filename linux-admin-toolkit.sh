@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Linux/macOS Admin Toolkit
-# Linux 与 macOS 软件安装、Shell 环境、Docker、防火墙、Swap/LVM、性能排查管理脚本。
+# Linux 与 macOS 软件安装、Shell 环境、Docker、防火墙、Swap/LVM、性能排查、主机巡检、用户/SSH、定时任务、日志、网络、系统配置、磁盘与进程管理脚本。
 # 默认使用官方源，也内置中国大陆常用镜像源，适合不同网络环境。
 # Linux 支持：Arch Linux、Kylin V10、CentOS/CentOS Stream、Ubuntu、Debian、Fedora 及常见衍生系统。
 # macOS 支持：Homebrew、常用工具、Zsh/Oh My Zsh、rupa/z、Docker Desktop、基础性能排查。
@@ -9,7 +9,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 PROGRAM_NAME="$(basename "$0")"
-TOOL_VERSION="0.5.0"
+TOOL_VERSION="0.6.0"
 ASSUME_YES=0
 DRY_RUN=0
 NO_COLOR=0
@@ -1605,6 +1605,1115 @@ system_update_check() { case "$PKG_MANAGER" in apt) run apt-get update; run apt 
 system_update_security() { ensure_linux_only "macOS 安全更新通过系统偏好设置安装。"; confirm "即将安装安全更新。是否继续？" || cancelled; case "$PKG_MANAGER" in apt) run apt-get update; run unattended-upgrade -d 2>/dev/null || run apt-get upgrade -y; success "安全更新完成。";; dnf) run dnf update --security -y 2>/dev/null || run dnf update-minimal --security -y 2>/dev/null || warn "dnf 安全更新不可用，请使用 system-update all。";; yum) run yum update --security -y 2>/dev/null || warn "yum 安全更新不可用，请使用 system-update all。";; *) warn "未检测到支持的包管理器。";; esac; }
 system_update_all() { confirm "即将更新所有系统软件包。是否继续？" || cancelled; case "$PKG_MANAGER" in apt) run apt-get update; run apt-get upgrade -y; run apt-get dist-upgrade -y 2>/dev/null || true; success "系统更新完成。";; dnf|yum) run dnf update -y 2>/dev/null || run yum update -y; success "系统更新完成。";; pacman) run pacman -Syu --noconfirm; success "系统更新完成。";; brew) brew_run update; brew_run upgrade; success "Homebrew 更新完成。";; *) warn "未检测到支持的包管理器。";; esac; }
 
+# ---------- 新模块公共辅助 ----------
+valid_linux_user() { local u="${1:-}"; [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ || "$u" =~ ^[a-z_][a-z0-9_-]{0,30}[$]$ ]]; }
+valid_hostname_label() { local h="${1:-}"; [[ "$h" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; }
+valid_hostname() {
+  local h="${1:-}" part IFS
+  local -a parts=()
+  [[ -n "$h" && ${#h} -le 253 ]] || return 1
+  [[ "$h" != *..* ]] || return 1
+  IFS='.'; read -ra parts <<< "$h"
+  for part in "${parts[@]}"; do valid_hostname_label "$part" || return 1; done
+  return 0
+}
+valid_host_or_ip() { [[ "${1:-}" =~ ^[A-Za-z0-9._:-]+$ ]]; }
+valid_port() { [[ "${1:-}" =~ ^[0-9]+$ && "$1" -ge 1 && "$1" -le 65535 ]]; }
+require_valid_user() { valid_linux_user "${1:-}" || fatal "非法用户名：${1:-}"; }
+cpu_count() { local n; n="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || printf 1)"; printf '%s' "${n:-1}"; }
+section() { echo; echo "========== $* =========="; }
+need_arg() { local name="$1" val="${2:-}" prompt="$3"; if [[ -z "$val" ]]; then read -r -p "$prompt" val || true; fi; printf '%s' "$val"; }
+
+# ---------- 主机巡检 health ----------
+HEALTH_OK=0; HEALTH_WARN=0; HEALTH_CRIT=0; HEALTH_ITEMS=()
+health_reset() { HEALTH_OK=0; HEALTH_WARN=0; HEALTH_CRIT=0; HEALTH_ITEMS=(); }
+health_item() {
+  local level="$1" msg="$2"
+  case "$level" in
+    OK) HEALTH_OK=$((HEALTH_OK + 1)); printf '  [OK]   %s\n' "$msg" ;;
+    WARN) HEALTH_WARN=$((HEALTH_WARN + 1)); printf '  [WARN] %s\n' "$msg" ;;
+    CRIT) HEALTH_CRIT=$((HEALTH_CRIT + 1)); printf '  [CRIT] %s\n' "$msg" ;;
+  esac
+  HEALTH_ITEMS+=("$level|$msg")
+}
+health_check_load() {
+  local load1 cpus
+  load1="$(awk '{print $1}' /proc/loadavg 2>/dev/null || uptime | awk -F'load average[s]?: ' '{print $2}' | awk -F, '{print $1}' | tr -d ' ')"
+  cpus="$(cpu_count)"
+  local load_rc=0
+  awk -v l="${load1:-0}" -v c="${cpus:-1}" 'BEGIN{
+    if (c<=0) c=1;
+    if (l >= c*2) exit 2;
+    if (l >= c) exit 1;
+    exit 0;
+  }' || load_rc=$?
+  case "$load_rc" in
+    2) health_item CRIT "1 分钟负载 ${load1}，CPU ${cpus} 核（>= 2x）" ;;
+    1) health_item WARN "1 分钟负载 ${load1}，CPU ${cpus} 核（>= 1x）" ;;
+    *) health_item OK "1 分钟负载 ${load1}，CPU ${cpus} 核" ;;
+  esac
+}
+health_check_memory() {
+  if is_macos; then
+    health_item OK "macOS 内存由系统统一管理（vm_stat 仅供参考）"
+    vm_stat 2>/dev/null | head -n 8 || true
+    return 0
+  fi
+  local avail_kb total_kb avail_pct swap_total swap_used swap_pct
+  avail_kb="$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || printf 0)"
+  total_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || printf 1)"
+  swap_total="$(awk '/SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || printf 0)"
+  swap_used="$(awk '/SwapTotal:/ {t=$2} /SwapFree:/ {f=$2} END{print t-f}' /proc/meminfo 2>/dev/null || printf 0)"
+  avail_pct="$(awk -v a="$avail_kb" -v t="$total_kb" 'BEGIN{ if(t<=0) t=1; printf "%.0f", a*100/t }')"
+  avail_pct="${avail_pct:-100}"
+  if [[ "$avail_pct" -le 5 ]]; then health_item CRIT "可用内存约 ${avail_pct}%（MemAvailable）"
+  elif [[ "$avail_pct" -le 10 ]]; then health_item WARN "可用内存约 ${avail_pct}%（MemAvailable）"
+  else health_item OK "可用内存约 ${avail_pct}%（MemAvailable）"; fi
+  if [[ "${swap_total:-0}" -gt 0 ]]; then
+    swap_pct="$(awk -v u="$swap_used" -v t="$swap_total" 'BEGIN{ printf "%.0f", u*100/t }')"
+    swap_pct="${swap_pct:-0}"
+    if [[ "$swap_pct" -ge 80 ]]; then health_item WARN "Swap 使用 ${swap_pct}%"
+    else health_item OK "Swap 使用 ${swap_pct}%"; fi
+  else
+    health_item OK "未配置 Swap"
+  fi
+}
+health_check_disks() {
+  local line usep ipct mp src
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    src="$(awk '{print $1}' <<< "$line")"
+    mp="$(awk '{print $6}' <<< "$line")"
+    usep="$(awk '{print $5}' <<< "$line" | tr -d '%')"
+    [[ "$usep" =~ ^[0-9]+$ ]] || continue
+    case "$src" in none|rootfs|drivers|overlay|tmpfs|devtmpfs) continue ;; esac
+    case "$mp" in /init|/usr/lib/wsl/*|/mnt/wsl*|/mnt/wslg*) continue ;; esac
+    if [[ "$usep" -ge 95 ]]; then health_item CRIT "磁盘 ${mp} 使用 ${usep}%（${src}）"
+    elif [[ "$usep" -ge 85 ]]; then health_item WARN "磁盘 ${mp} 使用 ${usep}%（${src}）"
+    else health_item OK "磁盘 ${mp} 使用 ${usep}%"; fi
+  done < <(
+    if df -P -x tmpfs >/dev/null 2>&1; then df -P -x tmpfs -x devtmpfs -x squashfs -x overlay 2>/dev/null | awk 'NR>1{print}'
+    else df -P 2>/dev/null | awk 'NR>1 && $1 !~ /^(tmpfs|devtmpfs|overlay|map)$/ {print}'
+    fi
+  )
+  if is_linux; then
+    while IFS= read -r line; do
+      mp="$(awk '{print $6}' <<< "$line")"
+      ipct="$(awk '{print $5}' <<< "$line" | tr -d '%')"
+      [[ "$ipct" =~ ^[0-9]+$ ]] || continue
+      case "$mp" in /init|/mnt/wsl*|/usr/lib/wsl/*) continue ;; esac
+      if [[ "$ipct" -ge 95 ]]; then health_item CRIT "inode ${mp} 使用 ${ipct}%"
+      elif [[ "$ipct" -ge 85 ]]; then health_item WARN "inode ${mp} 使用 ${ipct}%"
+      else health_item OK "inode ${mp} 使用 ${ipct}%"; fi
+    done < <(df -Pi -x tmpfs -x devtmpfs -x squashfs -x overlay 2>/dev/null | awk 'NR>1{print}' || true)
+    local ro_fstype ro_mp
+    while IFS= read -r line; do
+      ro_fstype="$(awk '{print $3}' <<< "$line")"
+      ro_mp="$(awk '{print $2}' <<< "$line")"
+      [[ -n "$ro_mp" ]] || continue
+      case "$ro_fstype" in proc|sysfs|devtmpfs|devpts|cgroup*|pstore|bpf|tracefs|debugfs|securityfs|fusectl|mqueue|hugetlbfs|overlay|squashfs|9p|autofs|rpc_pipefs|nsfs|binfmt_misc) continue ;; esac
+      case "$ro_mp" in /proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run|/run/*|/snap|/snap/*|/tmp/.X11-unix|/mnt/wsl*|/usr/lib/wsl/*|/init|/usr/lib/modules/*) continue ;; esac
+      health_item WARN "只读挂载：$ro_mp（$ro_fstype）"
+    done < <(awk '$4 ~ /(^|,)ro($|,)/ {print}' /proc/mounts 2>/dev/null || true)
+  fi
+}
+health_check_processes() {
+  local zombies dstate oom
+  zombies="$(ps -eo stat= 2>/dev/null | awk '$1 ~ /Z/ {c++} END{print c+0}')"
+  dstate="$(ps -eo stat= 2>/dev/null | awk '$1 ~ /^D/ {c++} END{print c+0}')"
+  zombies="${zombies:-0}"; dstate="${dstate:-0}"
+  [[ "$zombies" -gt 0 ]] && health_item WARN "僵尸进程 ${zombies} 个" || health_item OK "无僵尸进程"
+  [[ "$dstate" -gt 0 ]] && health_item WARN "不可中断睡眠(D) 进程 ${dstate} 个" || health_item OK "无 D 状态进程"
+  if is_linux && has_cmd journalctl; then
+    oom="$(journalctl -k --since '24 hours ago' --no-pager 2>/dev/null | grep -c -E 'Out of memory|Killed process' || true)"
+    [[ "${oom:-0}" -gt 0 ]] && health_item CRIT "近 24 小时内核日志出现 ${oom} 条 OOM/杀进程记录" || health_item OK "近 24 小时未见 OOM"
+  elif is_linux && [[ -r /var/log/kern.log ]]; then
+    oom="$(grep -c -E 'Out of memory|Killed process' /var/log/kern.log 2>/dev/null || true)"
+    [[ "${oom:-0}" -gt 0 ]] && health_item WARN "kern.log 中有 ${oom} 条历史 OOM 记录" || health_item OK "kern.log 未见 OOM"
+  fi
+}
+health_check_services() {
+  is_linux || return 0
+  if has_cmd systemctl; then
+    local failed n
+    failed="$(systemctl --failed --no-legend --no-pager 2>/dev/null | awk '{print $1}' || true)"
+    n="$(printf '%s\n' "$failed" | awk 'NF{c++} END{print c+0}')"
+    if [[ "$n" -gt 0 ]]; then health_item WARN "失败的 systemd 单元 ${n} 个：$(printf '%s' "$failed" | tr '\n' ' ')"
+    else health_item OK "无失败的 systemd 单元"; fi
+  fi
+}
+health_check_time() {
+  local synced="unknown"
+  if has_cmd timedatectl; then
+    timedatectl status 2>/dev/null | grep -E 'NTP|System clock|Time zone|synchronized' || true
+    if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -qx yes; then synced=yes
+    elif timedatectl status 2>/dev/null | grep -qi 'synchronized: yes'; then synced=yes
+    else synced=no; fi
+  elif has_cmd chronyc; then
+    chronyc tracking 2>/dev/null | head -n 5 || true
+    chronyc tracking 2>/dev/null | grep -qi 'Leap status.*Normal' && synced=yes || synced=no
+  fi
+  case "$synced" in
+    yes) health_item OK "时间已同步" ;;
+    no) health_item WARN "时间可能未同步" ;;
+    *) health_item WARN "无法确认时间同步状态" ;;
+  esac
+}
+health_check_network() {
+  local gw dns_ok=0 iface state
+  if is_linux; then
+    gw="$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')"
+    [[ -n "$gw" ]] && health_item OK "默认网关 ${gw}" || health_item CRIT "无默认路由"
+    while IFS= read -r iface; do
+      [[ -n "$iface" && -r "/sys/class/net/$iface/operstate" ]] || continue
+      state="$(cat "/sys/class/net/$iface/operstate" 2>/dev/null || true)"
+      case "$iface" in lo|docker*|br-*|veth*|cni*|flannel*|virbr*) continue ;; esac
+      [[ "$state" == "down" ]] && health_item WARN "网卡 ${iface} 状态 down"
+    done < <(ls /sys/class/net 2>/dev/null || true)
+  else
+    netstat -rn 2>/dev/null | head -n 8 || true
+    health_item OK "macOS 路由表已列出（请人工确认默认网关）"
+  fi
+  if has_cmd getent; then getent hosts localhost >/dev/null 2>&1 && dns_ok=1; fi
+  if [[ "$dns_ok" -eq 0 ]] && has_cmd ping; then ping -c 1 -W 2 127.0.0.1 >/dev/null 2>&1 && dns_ok=1; fi
+  if has_cmd getent && getent hosts one.one.one.one >/dev/null 2>&1; then health_item OK "DNS 可解析外部域名"
+  elif has_cmd nslookup && nslookup one.one.one.one >/dev/null 2>&1; then health_item OK "DNS 可解析外部域名"
+  else health_item WARN "外部 DNS 解析失败或网络隔离"; fi
+}
+health_run_checks() {
+  health_reset
+  section "系统"
+  print_env
+  echo "主机名：$(hostname 2>/dev/null || true)"
+  echo "时间：$(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || true)"
+  echo "运行时间：$(uptime -p 2>/dev/null || uptime || true)"
+  section "巡检项"
+  health_check_load
+  health_check_memory
+  health_check_disks
+  health_check_processes
+  health_check_services
+  health_check_time
+  health_check_network
+  section "摘要"
+  echo "正常 ${HEALTH_OK}    警告 ${HEALTH_WARN}    严重 ${HEALTH_CRIT}"
+  if [[ "$HEALTH_CRIT" -gt 0 ]]; then error "存在严重项，请优先处理。"; return 2
+  elif [[ "$HEALTH_WARN" -gt 0 ]]; then warn "存在警告项。"; return 1
+  else success "巡检未发现明显异常。"; return 0; fi
+}
+health_check() { local rc=0; health_run_checks || rc=$?; [[ "$rc" -eq 0 || "$rc" -eq 1 || "$rc" -eq 2 ]] && return 0; return "$rc"; }
+health_report() {
+  local out="${1:-}" ts file rc=0
+  ts="$(date +%Y%m%d-%H%M%S)"
+  if [[ -z "$out" ]]; then
+    if [[ -t 0 ]]; then read -r -p "报告输出路径 [/tmp/health-${ts}.txt]: " out || true; fi
+    out="${out:-/tmp/health-${ts}.txt}"
+  fi
+  [[ "$out" != *..* ]] || fatal "非法输出路径：$out"
+  info "生成巡检报告：$out"
+  if [[ "$DRY_RUN" -eq 1 ]]; then info "+ write health report $out"; health_run_checks || true; return 0; fi
+  mkdir -p "$(dirname "$out")"
+  set +e
+  health_run_checks > "$out" 2>&1
+  rc=$?
+  set -e
+  cat "$out"
+  success "报告已保存：$out"
+  return 0
+}
+
+# ---------- 用户与 SSH user / ssh-harden ----------
+user_home_of() { getent passwd "${1:-}" 2>/dev/null | awk -F: '{print $6}'; }
+user_exists() { getent passwd "${1:-}" >/dev/null 2>&1; }
+user_list() {
+  section "登录用户 / 可交互用户"
+  if is_macos; then dscl . -list /Users 2>/dev/null | head -n 50 || true; else
+    awk -F: '($3>=1000 && $1!="nobody") || $1=="root" {printf "%-16s uid=%-6s gid=%-6s home=%-20s shell=%s\n",$1,$3,$4,$6,$7}' /etc/passwd
+  fi
+  section "sudo / wheel / admin 组成员"
+  for g in sudo wheel admin; do
+    if getent group "$g" >/dev/null 2>&1; then echo "$g: $(getent group "$g" | awk -F: '{print $4}')"; fi
+  done
+  section "锁定 / 空密码检查"
+  if is_linux && [[ -r /etc/shadow ]]; then
+    awk -F: '($2=="" || $2=="!" || $2=="*" || $2 ~ /^!/) {printf "%-16s hash=%s\n",$1,($2==""?"EMPTY":$2)}' /etc/shadow | head -n 40
+    if awk -F: '$2=="" {found=1} END{exit !found}' /etc/shadow; then warn "存在空密码账号，请立即处理。"; fi
+  else
+    warn "无法读取 shadow，跳过空密码检查。"
+  fi
+  section "UID 0 账号"
+  awk -F: '$3==0 {print $1}' /etc/passwd 2>/dev/null || true
+}
+user_info() {
+  local u="${1:-}"
+  [[ -n "$u" ]] || u="$(need_arg user "" "用户名: ")"
+  [[ -n "$u" ]] || cancelled
+  require_valid_user "$u"
+  user_exists "$u" || fatal "用户不存在：$u"
+  getent passwd "$u" || true
+  id "$u" || true
+  if is_linux && [[ -r /etc/shadow ]]; then
+    awk -F: -v u="$u" '$1==u {printf "shadow: lastchg=%s min=%s max=%s warn=%s expire=%s\n",$3,$4,$5,$6,$8}' /etc/shadow
+  fi
+  echo "authorized_keys:"
+  local home keys; home="$(user_home_of "$u")"; keys="$home/.ssh/authorized_keys"
+  if [[ -f "$keys" ]]; then awk '{print NR, $1, $NF}' "$keys"; else echo "(无)"; fi
+}
+user_add() {
+  ensure_linux_only "macOS 用户请用 dscl / 系统设置创建。"
+  local u="${1:-}" groups="${2:-}" shell="${3:-/bin/bash}" create_home="${4:-1}"
+  [[ -n "$u" ]] || u="$(need_arg user "" "新用户名: ")"
+  [[ -n "$u" ]] || cancelled
+  require_valid_user "$u"
+  user_exists "$u" && fatal "用户已存在：$u"
+  [[ -n "$groups" ]] || { read -r -p "附加组（逗号分隔，可空）: " groups || true; }
+  [[ -n "${3:-}" ]] || { read -r -p "登录 Shell [$shell]: " _s || true; shell="${_s:-$shell}"; }
+  [[ "$shell" =~ ^/[A-Za-z0-9/._+-]+$ ]] || fatal "非法 Shell 路径：$shell"
+  confirm "即将创建用户 ${u}，组=${groups:-无}，shell=${shell}。是否继续？" || cancelled
+  local args=("$u" -s "$shell")
+  [[ "$create_home" == 1 ]] && args+=(-m)
+  if [[ -n "$groups" ]]; then
+    [[ "$groups" =~ ^[A-Za-z0-9_,-]+$ ]] || fatal "非法用户组列表：$groups"
+    args+=(-G "$groups")
+  fi
+  if has_cmd useradd; then run useradd "${args[@]}"
+  else fatal "未找到 useradd。"; fi
+  success "用户 ${u} 已创建。请用 passwd ${u} 设置密码，或 user key-add 写入公钥。"
+}
+user_lock() {
+  ensure_linux_only "macOS 不支持此 Linux 账户锁定操作。"
+  local u="${1:-}"
+  [[ -n "$u" ]] || u="$(need_arg user "" "要锁定的用户: ")"
+  require_valid_user "$u"; user_exists "$u" || fatal "用户不存在：$u"
+  [[ "$u" != root ]] || fatal "拒绝锁定 root。"
+  confirm "即将锁定用户 ${u}（禁止登录）。是否继续？" || cancelled
+  has_cmd usermod && run usermod -L "$u" || run passwd -l "$u"
+  success "用户 ${u} 已锁定。"
+}
+user_unlock() {
+  ensure_linux_only "macOS 不支持此 Linux 账户解锁操作。"
+  local u="${1:-}"
+  [[ -n "$u" ]] || u="$(need_arg user "" "要解锁的用户: ")"
+  require_valid_user "$u"; user_exists "$u" || fatal "用户不存在：$u"
+  confirm "即将解锁用户 ${u}。是否继续？" || cancelled
+  has_cmd usermod && run usermod -U "$u" || run passwd -u "$u"
+  success "用户 ${u} 已解锁。"
+}
+user_expire() {
+  ensure_linux_only "macOS 不支持此 Linux 账户过期操作。"
+  local u="${1:-}" day="${2:-}"
+  [[ -n "$u" ]] || u="$(need_arg user "" "用户名: ")"
+  require_valid_user "$u"; user_exists "$u" || fatal "用户不存在：$u"
+  [[ -n "$day" ]] || { read -r -p "过期日期 YYYY-MM-DD（空=立即过期）: " day || true; }
+  confirm "即将设置用户 ${u} 过期日期为 ${day:-立即}。是否继续？" || cancelled
+  if [[ -n "$day" ]]; then
+    [[ "$day" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || fatal "日期格式应为 YYYY-MM-DD"
+    run chage -E "$day" "$u"
+  else
+    run chage -E 0 "$u"
+  fi
+  success "用户 ${u} 过期设置已更新。"
+}
+user_sudo_add() {
+  ensure_linux_only "macOS 请把用户加入 admin 组。"
+  local u="${1:-}" file
+  [[ -n "$u" ]] || u="$(need_arg user "" "授予 sudo 的用户: ")"
+  require_valid_user "$u"; user_exists "$u" || fatal "用户不存在：$u"
+  confirm "即将授予 ${u} 免密 sudo（写入 sudoers.d）。是否继续？" || cancelled
+  run mkdir -p /etc/sudoers.d
+  file="/etc/sudoers.d/99-toolkit-${u}"
+  [[ "$file" =~ ^/etc/sudoers.d/99-toolkit-[a-z_][a-z0-9_-]*$ ]] || fatal "sudoers 路径非法"
+  if [[ "$DRY_RUN" -eq 1 ]]; then info "+ write $file"; else
+    printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$u" > "$file"
+    chmod 440 "$file"
+    visudo -cf "$file" >/dev/null || { rm -f "$file"; fatal "sudoers 语法校验失败，已撤回。"; }
+  fi
+  success "已授予 ${u} sudo。"
+}
+user_sudo_del() {
+  ensure_linux_only "macOS 请从 admin 组移除用户。"
+  local u="${1:-}" file
+  [[ -n "$u" ]] || u="$(need_arg user "" "取消 sudo 的用户: ")"
+  require_valid_user "$u"
+  file="/etc/sudoers.d/99-toolkit-${u}"
+  confirm "即将删除 ${file}。是否继续？" || cancelled
+  [[ -f "$file" ]] && run rm -f "$file" || warn "文件不存在：$file"
+  success "已尝试移除 ${u} 的 toolkit sudo 授权。"
+}
+user_keys() {
+  local u="${1:-}" home keys
+  [[ -n "$u" ]] || u="$(need_arg user "" "用户名: ")"
+  require_valid_user "$u"; user_exists "$u" || fatal "用户不存在：$u"
+  home="$(user_home_of "$u")"; keys="$home/.ssh/authorized_keys"
+  [[ -f "$keys" ]] || { warn "无 authorized_keys：$keys"; return 0; }
+  awk '{printf "%2d  %s  %s\n", NR, $1, $NF}' "$keys"
+}
+user_key_add() {
+  local u="${1:-}" key="${2:-}" home sshdir keys line
+  [[ -n "$u" ]] || u="$(need_arg user "" "用户名: ")"
+  require_valid_user "$u"; user_exists "$u" || fatal "用户不存在：$u"
+  [[ -n "$key" ]] || { echo "输入公钥内容，或公钥文件路径："; read -r key; }
+  [[ -n "$key" ]] || cancelled
+  if [[ -f "$key" ]]; then line="$(tr -d '\r' < "$key" | awk 'NF && $1 !~ /^#/{print; exit}')"
+  else line="$key"; fi
+  [[ "$line" =~ ^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)\  ]] || fatal "不像是合法 SSH 公钥。"
+  home="$(user_home_of "$u")"; sshdir="$home/.ssh"; keys="$sshdir/authorized_keys"
+  confirm "即将把公钥写入 ${keys}。是否继续？" || cancelled
+  run mkdir -p "$sshdir"
+  run chmod 700 "$sshdir"
+  if [[ "$DRY_RUN" -eq 1 ]]; then info "+ append key to $keys"; else
+    touch "$keys"
+    grep -qxF "$line" "$keys" 2>/dev/null || printf '%s\n' "$line" >> "$keys"
+    chmod 600 "$keys"
+    chown -R "$u:$(id -gn "$u")" "$sshdir" 2>/dev/null || true
+  fi
+  success "公钥已写入 ${u}。"
+}
+user_key_del() {
+  local u="${1:-}" pat="${2:-}" home keys tmp
+  [[ -n "$u" ]] || u="$(need_arg user "" "用户名: ")"
+  require_valid_user "$u"; user_exists "$u" || fatal "用户不存在：$u"
+  home="$(user_home_of "$u")"; keys="$home/.ssh/authorized_keys"
+  [[ -f "$keys" ]] || fatal "无 authorized_keys"
+  user_keys "$u"
+  [[ -n "$pat" ]] || { read -r -p "要删除的行号或注释/指纹关键词: " pat; }
+  [[ -n "$pat" ]] || cancelled
+  confirm "即将从 ${keys} 删除匹配 ${pat} 的行。是否继续？" || cancelled
+  if [[ "$DRY_RUN" -eq 1 ]]; then info "+ delete matching key from $keys"; return 0; fi
+  tmp="$(mktemp)"
+  if [[ "$pat" =~ ^[0-9]+$ ]]; then awk -v n="$pat" 'NR!=n' "$keys" > "$tmp"
+  else grep -vF "$pat" "$keys" > "$tmp" || true; fi
+  cat "$tmp" > "$keys"; rm -f "$tmp"; chmod 600 "$keys"
+  success "已更新 ${keys}。"
+}
+ssh_config_path() { if [[ -f /etc/ssh/sshd_config ]]; then printf /etc/ssh/sshd_config; elif [[ -f /etc/sshd_config ]]; then printf /etc/sshd_config; else printf /etc/ssh/sshd_config; fi; }
+ssh_get_cfg() {
+  local key="$1" file; file="$(ssh_config_path)"
+  [[ -f "$file" ]] || { printf 'unset'; return 0; }
+  awk -v k="$key" 'BEGIN{IGNORECASE=1} $1 !~ /^#/ && $1==k {print $2; found=1} END{if(!found) print "unset"}' "$file" | tail -n1
+}
+ssh_harden_audit() {
+  local file; file="$(ssh_config_path)"
+  section "SSH 配置审计：${file}"
+  [[ -f "$file" ]] || { warn "未找到 sshd_config"; return 0; }
+  local port rootlogin passauth empty allowu maxtry x11
+  port="$(ssh_get_cfg Port)"; rootlogin="$(ssh_get_cfg PermitRootLogin)"
+  passauth="$(ssh_get_cfg PasswordAuthentication)"; empty="$(ssh_get_cfg PermitEmptyPasswords)"
+  allowu="$(ssh_get_cfg AllowUsers)"; maxtry="$(ssh_get_cfg MaxAuthTries)"; x11="$(ssh_get_cfg X11Forwarding)"
+  printf '%-28s %s\n' Port "$port"
+  printf '%-28s %s\n' PermitRootLogin "$rootlogin"
+  printf '%-28s %s\n' PasswordAuthentication "$passauth"
+  printf '%-28s %s\n' PermitEmptyPasswords "$empty"
+  printf '%-28s %s\n' AllowUsers "$allowu"
+  printf '%-28s %s\n' MaxAuthTries "$maxtry"
+  printf '%-28s %s\n' X11Forwarding "$x11"
+  echo
+  [[ "$empty" == yes ]] && warn "允许空密码登录" || info "空密码：${empty}"
+  [[ "$rootlogin" == yes ]] && warn "允许 root 密码/登录：PermitRootLogin yes"
+  [[ "$passauth" == yes || "$passauth" == unset ]] && warn "密码登录可能仍开启"
+  [[ "$maxtry" == unset || ( "$maxtry" =~ ^[0-9]+$ && "$maxtry" -gt 6 ) ]] && warn "MaxAuthTries 偏大或未设置"
+  if has_cmd sshd; then
+    local sshd_err
+    sshd_err="$(sshd -t 2>&1 || true)"
+    if [[ -z "$sshd_err" ]]; then success "sshd_config 语法正常"
+    elif printf '%s' "$sshd_err" | grep -qi 'no hostkeys'; then warn "sshd 未配置 host key（配置语法仍可能正常）"
+    else error "sshd -t：${sshd_err}"; fi
+  fi
+  section "最近失败登录"
+  if has_cmd lastb; then lastb -n 8 2>/dev/null || true
+  elif has_cmd journalctl; then journalctl -u ssh -u sshd --since '24 hours ago' --no-pager 2>/dev/null | grep -iE 'fail|invalid' | tail -n 8 || true
+  fi
+}
+ssh_set_kv() {
+  local file="$1" key="$2" value="$3" tmp
+  if [[ "$DRY_RUN" -eq 1 ]]; then info "+ set $key $value in $file"; return 0; fi
+  tmp="$(mktemp)"
+  awk -v k="$key" 'BEGIN{IGNORECASE=1} !(tolower($1)==tolower(k)) {print}' "$file" > "$tmp"
+  printf '%s %s\n' "$key" "$value" >> "$tmp"
+  cat "$tmp" > "$file"; rm -f "$tmp"
+}
+ssh_harden_apply() {
+  ensure_linux_only "macOS sshd 配置路径与行为不同，请手工修改。"
+  local file; file="$(ssh_config_path)"
+  [[ -f "$file" ]] || fatal "未找到 sshd_config"
+  local no_root=0 no_pass=0 port="" allow_users=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --no-root-login) no_root=1 ;;
+      --no-password) no_pass=1 ;;
+      --port) shift; port="${1:-}" ;;
+      --port=*) port="${1#*=}" ;;
+      --allow-users) shift; allow_users="${1:-}" ;;
+      --allow-users=*) allow_users="${1#*=}" ;;
+    esac
+    shift || true
+  done
+  if [[ -t 0 && "$no_root" -eq 0 && "$no_pass" -eq 0 && -z "$port" && -z "$allow_users" ]]; then
+    echo "可选加固项（默认只应用安全基线：禁空密码、MaxAuthTries 4）："
+    read -r -p "禁止 root 登录？[y/N] " _a; [[ "${_a:-}" =~ ^[yY]$ ]] && no_root=1
+    read -r -p "禁止密码登录（只留公钥）？[y/N] " _a; [[ "${_a:-}" =~ ^[yY]$ ]] && no_pass=1
+    read -r -p "修改 SSH 端口（空=不改）: " port || true
+    read -r -p "AllowUsers 白名单（逗号分隔，空=不设）: " allow_users || true
+  fi
+  [[ -z "$port" || "$port" =~ ^[0-9]+$ ]] || fatal "非法端口：$port"
+  [[ -z "$port" || ( "$port" -ge 1 && "$port" -le 65535 ) ]] || fatal "端口越界：$port"
+  echo "将应用："
+  echo "  PermitEmptyPasswords no"
+  echo "  MaxAuthTries 4"
+  [[ "$no_root" -eq 1 ]] && echo "  PermitRootLogin no"
+  [[ "$no_pass" -eq 1 ]] && echo "  PasswordAuthentication no" && echo "  KbdInteractiveAuthentication no" && echo "  ChallengeResponseAuthentication no"
+  [[ -n "$port" ]] && echo "  Port $port"
+  [[ -n "$allow_users" ]] && echo "  AllowUsers ${allow_users//,/ }"
+  warn "请保持当前 SSH 会话不要断开；建议另开一个窗口先测新配置。"
+  confirm "即将备份并修改 ${file}，校验通过后 reload sshd。是否继续？" || cancelled
+  backup_file_if_exists "$file"
+  ssh_set_kv "$file" PermitEmptyPasswords no
+  ssh_set_kv "$file" MaxAuthTries 4
+  [[ "$no_root" -eq 1 ]] && ssh_set_kv "$file" PermitRootLogin no
+  if [[ "$no_pass" -eq 1 ]]; then
+    ssh_set_kv "$file" PasswordAuthentication no
+    ssh_set_kv "$file" KbdInteractiveAuthentication no
+    ssh_set_kv "$file" ChallengeResponseAuthentication no
+  fi
+  [[ -n "$port" ]] && ssh_set_kv "$file" Port "$port"
+  [[ -n "$allow_users" ]] && ssh_set_kv "$file" AllowUsers "${allow_users//,/ }"
+  if [[ "$DRY_RUN" -eq 1 ]]; then success "dry-run：未真正改 sshd。"; return 0; fi
+  if has_cmd sshd; then sshd -t || fatal "sshd -t 失败，请用备份回滚：$file.bak.*"; fi
+  if has_cmd systemctl; then run systemctl reload sshd 2>/dev/null || run systemctl reload ssh 2>/dev/null || run systemctl reload sshd.service || warn "reload 失败，请手动 systemctl reload sshd"
+  elif has_cmd service; then run service ssh reload || run service sshd reload || true
+  fi
+  success "SSH 基线已应用。请立即用新窗口验证登录。"
+}
+
+# ---------- 定时任务 cron ----------
+cron_user_or_ask() { local u="${1:-}"; if [[ -z "$u" ]]; then read -r -p "用户 [root]: " u || true; u="${u:-root}"; fi; require_valid_user "$u"; printf '%s' "$u"; }
+cron_list() {
+  local target="${1:-}"
+  if [[ "$target" == timers || "$target" == timer ]]; then
+    ensure_linux_only "macOS 无 systemd timer。"
+    section "systemd timers"
+    has_cmd systemctl && systemctl list-timers --all --no-pager || warn "未检测到 systemctl"
+    return 0
+  fi
+  if [[ "$target" == system ]]; then
+    section "/etc/crontab"
+    [[ -f /etc/crontab ]] && grep -vE '^[[:space:]]*(#|$)' /etc/crontab || echo "(无)"
+    section "/etc/cron.d"
+    if [[ -d /etc/cron.d ]]; then
+      local f; for f in /etc/cron.d/*; do [[ -f "$f" ]] || continue; echo "--- $f ---"; grep -vE '^[[:space:]]*(#|$)' "$f" || true; done
+    fi
+    section "cron.hourly/daily/weekly/monthly"
+    ls -l /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly 2>/dev/null || true
+    return 0
+  fi
+  if [[ "$target" == all ]]; then
+    cron_list system
+    if is_linux && [[ -d /var/spool/cron/crontabs ]]; then
+      local u; for u in /var/spool/cron/crontabs/*; do [[ -f "$u" ]] || continue; section "crontab $(basename "$u")"; crontab -u "$(basename "$u")" -l 2>/dev/null || cat "$u"; done
+    elif [[ -d /var/spool/cron ]]; then
+      local u; for u in /var/spool/cron/*; do [[ -f "$u" ]] || continue; section "crontab $(basename "$u")"; crontab -u "$(basename "$u")" -l 2>/dev/null || cat "$u"; done
+    fi
+    cron_list timers || true
+    return 0
+  fi
+  local u; u="$(cron_user_or_ask "$target")"
+  section "crontab -u $u"
+  crontab -u "$u" -l 2>/dev/null || crontab -l 2>/dev/null || warn "用户 ${u} 无 crontab 或无权读取"
+}
+cron_add() {
+  local u="${1:-}" line="${2:-}"
+  if [[ -n "$u" && -z "$line" ]] && ! valid_linux_user "$u"; then line="$u"; u="root"; fi
+  u="$(cron_user_or_ask "$u")"
+  [[ -n "$line" ]] || { echo "输入完整 crontab 行，例如：0 2 * * * /usr/local/bin/backup.sh"; read -r line; }
+  [[ -n "$line" ]] || cancelled
+  [[ "$line" != *$'\n'* ]] || fatal "crontab 行不能包含换行"
+  confirm "即将向用户 ${u} 追加：${line}。是否继续？" || cancelled
+  if [[ "$DRY_RUN" -eq 1 ]]; then info "+ crontab add for $u: $line"; return 0; fi
+  local tmp; tmp="$(mktemp)"
+  crontab -u "$u" -l 2>/dev/null | grep -vE '^[[:space:]]*$' > "$tmp" || true
+  printf '%s\n' "$line" >> "$tmp"
+  crontab -u "$u" "$tmp"
+  rm -f "$tmp"
+  success "已写入 ${u} 的 crontab。"
+}
+cron_remove() {
+  local u="${1:-}" pat="${2:-}"
+  if [[ -n "$u" && -z "$pat" ]] && ! valid_linux_user "$u"; then pat="$u"; u="root"; fi
+  u="$(cron_user_or_ask "$u")"
+  crontab -u "$u" -l 2>/dev/null || fatal "用户 ${u} 无 crontab"
+  [[ -n "$pat" ]] || { read -r -p "要删除的行号或匹配关键词: " pat; }
+  [[ -n "$pat" ]] || cancelled
+  confirm "即将从 ${u} 的 crontab 删除匹配 ${pat} 的行。是否继续？" || cancelled
+  if [[ "$DRY_RUN" -eq 1 ]]; then info "+ crontab remove for $u: $pat"; return 0; fi
+  local tmp; tmp="$(mktemp)"
+  if [[ "$pat" =~ ^[0-9]+$ ]]; then crontab -u "$u" -l 2>/dev/null | awk -v n="$pat" 'NR!=n' > "$tmp"
+  else crontab -u "$u" -l 2>/dev/null | grep -vF "$pat" > "$tmp" || true; fi
+  crontab -u "$u" "$tmp"
+  rm -f "$tmp"
+  success "已更新 ${u} 的 crontab。"
+}
+cron_backup() {
+  local u="${1:-}" dest ts dir
+  ts="$(date +%Y%m%d-%H%M%S)"
+  dir="${BACKUP_ROOT}/cron"
+  [[ -n "$u" ]] || { read -r -p "备份哪个用户的 crontab（空=全部/system）: " u || true; }
+  run mkdir -p "$dir"
+  if [[ -z "$u" || "$u" == all ]]; then
+    dest="$dir/all-${ts}"
+    run mkdir -p "$dest"
+    crontab -l > "$dest/root.crontab" 2>/dev/null || true
+    [[ -f /etc/crontab ]] && run cp -a /etc/crontab "$dest/etc-crontab"
+    [[ -d /etc/cron.d ]] && run cp -a /etc/cron.d "$dest/cron.d"
+    success "cron 备份目录：$dest"
+  else
+    require_valid_user "$u"
+    dest="$dir/${u}-${ts}.crontab"
+    if [[ "$DRY_RUN" -eq 1 ]]; then info "+ backup crontab $u -> $dest"; return 0; fi
+    crontab -u "$u" -l > "$dest"
+    success "已备份到 $dest"
+  fi
+}
+cron_restore() {
+  local file="${1:-}" u="${2:-}"
+  [[ -n "$file" ]] || { read -r -p "crontab 备份文件: " file; }
+  [[ -f "$file" ]] || fatal "文件不存在：$file"
+  u="$(cron_user_or_ask "$u")"
+  confirm "即将用 ${file} 覆盖用户 ${u} 的 crontab。是否继续？" || cancelled
+  run crontab -u "$u" "$file"
+  success "已恢复 ${u} 的 crontab。"
+}
+cron_timers() { cron_list timers; }
+
+# ---------- 日志与排障 log ----------
+log_journal() {
+  ensure_linux_only "macOS 请用 log show。"
+  has_cmd journalctl || fatal "未检测到 journalctl"
+  local unit="${1:-}" prio="${2:-}" since="${3:-}" lines="${4:-100}"
+  [[ -n "$unit" ]] || { read -r -p "单元名（空=全部）: " unit || true; }
+  [[ -n "$prio" ]] || { read -r -p "最低优先级 emerg|alert|crit|err|warning|notice|info|debug [warning]: " prio || true; prio="${prio:-warning}"; }
+  [[ -n "$since" ]] || { read -r -p "起始时间，如 2 hours ago / today [2 hours ago]: " since || true; since="${since:-2 hours ago}"; }
+  local args=(--no-pager -n "$lines" -p "$prio" --since "$since")
+  [[ -n "$unit" ]] && args+=(-u "$unit")
+  run journalctl "${args[@]}"
+}
+log_events() {
+  local hours="${1:-24}"
+  [[ "$hours" =~ ^[0-9]+$ ]] || fatal "小时数必须是数字：$hours"
+  section "最近 ${hours} 小时关键事件"
+  if is_linux && has_cmd journalctl; then
+    echo "--- reboot / shutdown ---"
+    journalctl --list-boots --no-pager 2>/dev/null | tail -n 8 || true
+    echo "--- OOM / killed ---"
+    journalctl -k --since "${hours} hours ago" --no-pager 2>/dev/null | grep -iE 'Out of memory|Killed process|oom-kill' | tail -n 20 || echo "(无)"
+    echo "--- I/O / filesystem 错误 ---"
+    journalctl -k --since "${hours} hours ago" --no-pager 2>/dev/null | grep -iE 'I/O error|Buffer I/O error|Read-only file system|blocked for more than|ext4_error|XFS:.*error' | tail -n 20 || echo "(无)"
+    echo "--- segfault / panic ---"
+    journalctl -k --since "${hours} hours ago" --no-pager 2>/dev/null | grep -iE 'segfault|Kernel panic|Oops:|BUG: |Call Trace:' | tail -n 20 || echo "(无)"
+    echo "--- 认证失败 ---"
+    journalctl --since "${hours} hours ago" --no-pager _COMM=sshd 2>/dev/null | grep -iE 'fail|invalid|refused' | tail -n 20 || true
+  else
+    last -x 2>/dev/null | head -n 15 || true
+    warn "无 journalctl，仅列出最近登录/重启。"
+  fi
+}
+log_search() {
+  local kw="${1:-}" path="${2:-/var/log}"
+  [[ -n "$kw" ]] || kw="$(need_arg kw "" "关键词: ")"
+  [[ -n "$kw" ]] || cancelled
+  [[ -d "$path" || -f "$path" ]] || fatal "路径不存在：$path"
+  info "在 ${path} 搜索：${kw}"
+  if has_cmd grep; then
+    grep -R --binary-files=without-match -n -I -F -- "$kw" "$path" 2>/dev/null | tail -n 80 || true
+  fi
+}
+log_collect() {
+  local hours="${1:-2}" out="${2:-}" ts dest
+  [[ "$hours" =~ ^[0-9]+$ ]] || fatal "小时数必须是数字：$hours"
+  ts="$(date +%Y%m%d-%H%M%S)"
+  [[ -n "$out" ]] || { read -r -p "输出包路径 [/tmp/incident-${ts}.tgz]: " out || true; out="${out:-/tmp/incident-${ts}.tgz}"; }
+  info "采集近 ${hours} 小时现场 -> $out"
+  if [[ "$DRY_RUN" -eq 1 ]]; then info "+ collect logs --hours $hours -> $out"; return 0; fi
+  dest="$(mktemp -d /tmp/incident.XXXXXX)"
+  {
+    echo "time=$(date -Is 2>/dev/null || date)"
+    echo "host=$(hostname)"
+    print_env
+    echo
+    uptime || true
+    echo
+    df -hT 2>/dev/null || df -h || true
+    echo
+    free -h 2>/dev/null || true
+    echo
+    ip addr 2>/dev/null || ifconfig || true
+    echo
+    ps auxf 2>/dev/null || ps aux || true
+  } > "$dest/summary.txt" 2>&1 || true
+  dmesg -T 2>/dev/null | tail -n 400 > "$dest/dmesg.txt" || dmesg | tail -n 400 > "$dest/dmesg.txt" || true
+  if has_cmd journalctl; then
+    journalctl --since "${hours} hours ago" --no-pager > "$dest/journal.txt" 2>/dev/null || true
+    journalctl -k --since "${hours} hours ago" --no-pager > "$dest/journal-kernel.txt" 2>/dev/null || true
+  fi
+  mkdir -p "$dest/var-log"
+  local f; for f in /var/log/syslog /var/log/messages /var/log/auth.log /var/log/secure /var/log/kern.log /var/log/nginx/error.log /var/log/nginx/access.log /var/log/docker.log; do
+    [[ -f "$f" ]] && cp -a "$f" "$dest/var-log/$(echo "$f" | tr '/' '_')" 2>/dev/null || true
+  done
+  if has_cmd tar; then
+    tar -C "$(dirname "$dest")" -czf "$out" "$(basename "$dest")"
+    rm -rf "$dest"
+    success "现场包：$out"
+  else
+    warn "未找到 tar，现场目录保留在 $dest"
+  fi
+}
+
+# ---------- 网络诊断 net ----------
+net_info() {
+  section "主机名 / DNS"
+  echo "hostname: $(hostname 2>/dev/null || true)"
+  [[ -f /etc/resolv.conf ]] && grep -vE '^[[:space:]]*(#|$)' /etc/resolv.conf || true
+  if has_cmd resolvectl; then echo; resolvectl status 2>/dev/null | head -n 40 || true; fi
+  section "地址"
+  if has_cmd ip; then ip -br addr; echo; ip route; else ifconfig; netstat -rn 2>/dev/null || true; fi
+  section "默认网关探测"
+  local gw=""
+  gw="$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')"
+  if [[ -n "$gw" ]] && has_cmd ping; then ping -c 2 -W 2 "$gw" || warn "网关 ${gw} ping 失败"; elif [[ -z "$gw" ]]; then warn "无默认网关"; fi
+}
+net_listen() {
+  local port="${1:-}"
+  section "监听端口"
+  if has_cmd ss; then
+    if [[ -n "$port" ]]; then ss -lntup 2>/dev/null | grep -E ":${port}[[:space:]]|: ${port} " || ss -lntup | grep ":$port" || warn "未找到端口 $port"
+    else ss -lntup 2>/dev/null || ss -lntu; fi
+  elif has_cmd netstat; then
+    netstat -lntup 2>/dev/null || netstat -anv 2>/dev/null | head -n 40
+  else warn "未找到 ss/netstat"; fi
+}
+net_who() {
+  local port="${1:-}"
+  [[ -n "$port" ]] || port="$(need_arg port "" "端口: ")"
+  [[ "$port" =~ ^[0-9]+$ ]] || fatal "非法端口：$port"
+  net_listen "$port"
+  if has_cmd lsof; then section "lsof"; lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || lsof -nP -i:":$port" 2>/dev/null || true; fi
+}
+net_dns() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || { read -r -p "要解析的域名 [one.one.one.one]: " name || true; name="${name:-one.one.one.one}"; }
+  section "resolv.conf"
+  [[ -f /etc/resolv.conf ]] && cat /etc/resolv.conf || true
+  if has_cmd dig; then section "dig"; dig +time=2 +tries=1 "$name" || true
+  elif has_cmd nslookup; then section "nslookup"; nslookup "$name" || true
+  elif has_cmd getent; then section "getent"; getent hosts "$name" || warn "解析失败"
+  else warn "无 dig/nslookup/getent"; fi
+}
+net_ping() {
+  local host="${1:-}"
+  [[ -n "$host" ]] || host="$(need_arg host "" "主机/IP: ")"
+  [[ -n "$host" ]] || cancelled
+  valid_host_or_ip "$host" || fatal "非法主机：$host"
+  has_cmd ping || fatal "未找到 ping"
+  if is_macos; then run ping -c 4 "$host"; else run ping -c 4 -W 2 "$host"; fi
+}
+net_probe() {
+  local target="${1:-}" host port
+  [[ -n "$target" ]] || target="$(need_arg target "" "目标 host:port : ")"
+  [[ -n "$target" ]] || cancelled
+  host="${target%%:*}"; port="${target##*:}"
+  [[ "$host" != "$port" ]] || fatal "格式应为 host:port，例如 1.1.1.1:443"
+  valid_host_or_ip "$host" || fatal "非法主机：$host"
+  valid_port "$port" || fatal "非法端口：$port"
+  info "探测 ${host}:${port}"
+  if has_cmd timeout; then
+    if timeout 3 bash -c "echo >/dev/tcp/${host}/${port}" >/dev/null 2>&1; then success "TCP ${host}:${port} 可连通"; return 0; fi
+  elif bash -c "echo >/dev/tcp/${host}/${port}" >/dev/null 2>&1; then
+    success "TCP ${host}:${port} 可连通"; return 0
+  fi
+  if has_cmd nc; then nc -z -w 3 "$host" "$port" >/dev/null 2>&1 && { success "nc 探测成功"; return 0; }; fi
+  warn "无法连通 ${host}:${port}"
+  return 1
+}
+net_route() {
+  section "路由表"
+  if has_cmd ip; then ip route show; echo; ip -6 route show 2>/dev/null || true
+  else netstat -rn || true; fi
+  if has_cmd traceroute; then
+    local dest="${1:-}"
+    [[ -n "$dest" ]] || { read -r -p "traceroute 目标（空=跳过）: " dest || true; }
+    [[ -n "$dest" ]] && traceroute -m 15 -w 2 "$dest" || true
+  elif has_cmd mtr; then
+    local dest="${1:-}"
+    [[ -n "$dest" ]] || { read -r -p "mtr 目标（空=跳过）: " dest || true; }
+    [[ -n "$dest" ]] && mtr -r -c 5 "$dest" || true
+  fi
+}
+
+# ---------- 系统配置 sysconf ----------
+sysconf_hostname() {
+  local name="${1:-}"
+  echo "当前主机名：$(hostname)"
+  [[ -n "$name" ]] || { read -r -p "新主机名（空=只查看）: " name || true; }
+  [[ -n "$name" ]] || return 0
+  valid_hostname "$name" || fatal "非法主机名：$name"
+  confirm "即将设置主机名为 ${name}。是否继续？" || cancelled
+  if has_cmd hostnamectl; then run hostnamectl set-hostname "$name"
+  else run hostname "$name"; [[ -w /etc/hostname ]] && write_file /etc/hostname <<< "$name" || true; fi
+  if [[ -f /etc/hosts ]]; then
+    backup_file_if_exists /etc/hosts
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+      if grep -qE '^127\.0\.1\.1[[:space:]]' /etc/hosts; then
+        sed -i.bak.hostname "s/^127\.0\.1\.1.*/127.0.1.1\t${name}/" /etc/hosts
+      else
+        append_line_if_missing /etc/hosts $'127.0.1.1\t'"$name"
+      fi
+    fi
+  fi
+  success "主机名已设置为 ${name}。"
+}
+sysconf_timezone() {
+  local tz="${1:-}"
+  if has_cmd timedatectl; then timedatectl | grep -E 'Time zone|Local time|Universal' || timedatectl; else date; [[ -L /etc/localtime ]] && readlink /etc/localtime || true; fi
+  [[ -n "$tz" ]] || { read -r -p "时区（如 Asia/Shanghai，空=只查看）: " tz || true; }
+  [[ -n "$tz" ]] || return 0
+  [[ "$tz" =~ ^[A-Za-z0-9/_+-]+$ ]] || fatal "非法时区：$tz"
+  [[ -e "/usr/share/zoneinfo/$tz" ]] || warn "未找到 /usr/share/zoneinfo/${tz}，仍尝试设置。"
+  confirm "即将设置时区为 ${tz}。是否继续？" || cancelled
+  if has_cmd timedatectl; then run timedatectl set-timezone "$tz"
+  else run ln -sfn "/usr/share/zoneinfo/$tz" /etc/localtime; fi
+  success "时区已设置为 ${tz}。"
+}
+sysconf_time() {
+  section "当前时间"
+  date
+  has_cmd timedatectl && timedatectl || true
+  if has_cmd chronyc; then section "chrony"; chronyc tracking 2>/dev/null || true; chronyc sources 2>/dev/null | head -n 10 || true; fi
+  if has_cmd ntpq; then section "ntpd"; ntpq -p 2>/dev/null || true; fi
+}
+sysconf_ntp() {
+  local action="${1:-status}"
+  case "$action" in
+    status|"") sysconf_time ;;
+    enable)
+      ensure_linux_only "macOS 时间同步由系统设置管理。"
+      confirm "即将启用时间同步（优先 chrony / systemd-timesyncd）。是否继续？" || cancelled
+      if has_cmd chronyd || pkg_install chrony; then
+        has_cmd systemctl && run systemctl enable --now chronyd 2>/dev/null || run systemctl enable --now chrony 2>/dev/null || true
+      elif has_cmd timedatectl; then
+        run timedatectl set-ntp true
+      fi
+      success "已尝试启用时间同步。"
+      sysconf_time
+      ;;
+    *) fatal "未知 ntp 动作：$action（status|enable）" ;;
+  esac
+}
+sysconf_hosts() {
+  local action="${1:-list}" ip="${2:-}" name="${3:-}"
+  case "$action" in
+    list|"") section "/etc/hosts"; cat /etc/hosts 2>/dev/null || true ;;
+    add)
+      [[ -n "$ip" ]] || ip="$(need_arg ip "" "IP: ")"
+      [[ -n "$name" ]] || name="$(need_arg name "" "主机名: ")"
+      [[ "$ip" =~ ^[0-9a-fA-F:.]+$ ]] || fatal "非法 IP：$ip"
+      valid_hostname "$name" || fatal "非法主机名：$name"
+      confirm "即将追加：${ip} ${name}。是否继续？" || cancelled
+      backup_file_if_exists /etc/hosts
+      append_line_if_missing /etc/hosts "${ip} ${name}"
+      success "已写入 /etc/hosts。"
+      ;;
+    del)
+      name="${2:-}"
+      [[ -n "$name" ]] || name="$(need_arg name "" "要删除的主机名或 IP: ")"
+      [[ "$name" =~ ^[A-Za-z0-9._:-]+$ ]] || fatal "非法匹配串：$name"
+      confirm "即将从 /etc/hosts 删除包含 ${name} 的行。是否继续？" || cancelled
+      backup_file_if_exists /etc/hosts
+      [[ -f /etc/hosts ]] && run sed -i.bak.hosts "/${name}/d" /etc/hosts
+      success "已更新 /etc/hosts。"
+      ;;
+    *) fatal "未知 hosts 动作：$action（list|add|del）" ;;
+  esac
+}
+sysconf_sysctl() {
+  ensure_linux_only "macOS sysctl 持久化方式不同。"
+  local action="${1:-list}" kv="${2:-}" key value file
+  file="/etc/sysctl.d/99-linux-admin-toolkit.conf"
+  case "$action" in
+    list|"")
+      section "常用内核参数"
+      for key in fs.file-max vm.swappiness net.core.somaxconn fs.inotify.max_user_watches net.ipv4.ip_forward; do
+        printf '%-36s %s\n' "$key" "$(sysctl -n "$key" 2>/dev/null || echo unset)"
+      done
+      [[ -f "$file" ]] && { section "脚本持久化文件 $file"; cat "$file"; }
+      ;;
+    set|persist)
+      [[ -n "$kv" ]] || kv="$(need_arg kv "" "参数，如 vm.swappiness=10: ")"
+      [[ "$kv" == *=* ]] || fatal "格式应为 key=value"
+      key="${kv%%=*}"; value="${kv#*=}"
+      [[ "$key" =~ ^[A-Za-z0-9_.-]+$ ]] || fatal "非法 sysctl 键：$key"
+      [[ "$value" =~ ^[A-Za-z0-9._:/-]+$ ]] || fatal "非法 sysctl 值：$value"
+      confirm "即将设置 ${key}=${value}${action:+（$action）}。是否继续？" || cancelled
+      run sysctl -w "${key}=${value}"
+      if [[ "$action" == persist ]]; then
+        run mkdir -p /etc/sysctl.d
+        if [[ "$DRY_RUN" -eq 1 ]]; then info "+ persist $key=$value -> $file"
+        else
+          touch "$file"
+          if grep -qE "^${key}[[:space:]]*=" "$file"; then sed -i.bak.sysctl "s|^${key}[[:space:]]*=.*|${key} = ${value}|" "$file"
+          else printf '%s = %s\n' "$key" "$value" >> "$file"; fi
+        fi
+        success "已写入 $file"
+      fi
+      ;;
+    *) fatal "未知 sysctl 动作：$action（list|set|persist）" ;;
+  esac
+}
+sysconf_limits() {
+  ensure_linux_only "macOS 资源限制请用 launchctl limit。"
+  local action="${1:-show}" item="${2:-}" value="${3:-}" file domain
+  file="/etc/security/limits.d/99-linux-admin-toolkit.conf"
+  case "$action" in
+    show|"")
+      section "当前 shell 限制"; ulimit -a 2>/dev/null || true
+      [[ -f /etc/security/limits.conf ]] && { section "limits.conf 非注释行"; grep -vE '^[[:space:]]*(#|$)' /etc/security/limits.conf || true; }
+      [[ -f "$file" ]] && { section "$file"; cat "$file"; }
+      ;;
+    set)
+      [[ -n "$item" ]] || item="$(need_arg item "" "项目 nofile|nproc: ")"
+      [[ -n "$value" ]] || value="$(need_arg value "" "值，如 65535: ")"
+      [[ "$item" =~ ^[a-z]+$ ]] || fatal "非法 limits 项：$item"
+      [[ "$value" =~ ^[0-9]+$ ]] || fatal "值必须是数字：$value"
+      domain="${4:-*}"
+      confirm "即将持久化 ${domain} ${item}=${value} 到 ${file}。是否继续？" || cancelled
+      run mkdir -p /etc/security/limits.d
+      if [[ "$DRY_RUN" -eq 1 ]]; then info "+ limits $domain $item $value"
+      else
+        touch "$file"
+        grep -vE "^${domain}[[:space:]]+.+[[:space:]]+${item}[[:space:]]" "$file" > "${file}.tmp" || true
+        printf '%s soft %s %s\n%s hard %s %s\n' "$domain" "$item" "$value" "$domain" "$item" "$value" >> "${file}.tmp"
+        cat "${file}.tmp" > "$file"; rm -f "${file}.tmp"
+      fi
+      success "已写入 $file（新登录会话生效）。"
+      ;;
+    *) fatal "未知 limits 动作：$action（show|set）" ;;
+  esac
+}
+
+# ---------- 磁盘与文件系统 disk（非 LVM） ----------
+disk_list() {
+  section "块设备"
+  if has_cmd lsblk; then lsblk -o NAME,SIZE,TYPE,FSTYPE,UUID,MOUNTPOINT,RO,MODEL
+  else df -h; fi
+  section "挂载"
+  findmnt -A 2>/dev/null || mount | head -n 40 || true
+  section "磁盘使用"
+  df -hT 2>/dev/null || df -h
+  if is_linux; then section "inode"; df -hi -x tmpfs -x devtmpfs 2>/dev/null || true; fi
+}
+disk_smart() {
+  local dev="${1:-}"
+  if ! has_cmd smartctl; then
+    warn "未安装 smartctl，尝试安装 smartmontools。"
+    is_macos && brew_install smartmontools || pkg_install smartmontools || true
+  fi
+  has_cmd smartctl || fatal "未找到 smartctl"
+  if [[ -z "$dev" ]]; then
+    section "磁盘一览"
+    has_cmd lsblk && lsblk -d -o NAME,SIZE,MODEL,ROTA || true
+    read -r -p "设备路径（空=检查所有磁盘）: " dev || true
+  fi
+  if [[ -n "$dev" ]]; then
+    [[ -b "$dev" || -c "$dev" ]] || fatal "不是块设备：$dev"
+    run smartctl -H "$dev" || true
+    run smartctl -A "$dev" || true
+  else
+    local d
+    for d in /dev/sd[a-z] /dev/nvme[0-9]n[0-9] /dev/vd[a-z] /dev/xvd[a-z]; do
+      [[ -b "$d" ]] || continue
+      section "SMART $d"
+      smartctl -H "$d" 2>/dev/null || true
+    done
+  fi
+}
+disk_fstab() {
+  section "/etc/fstab"
+  [[ -f /etc/fstab ]] && grep -vE '^[[:space:]]*(#|$)' /etc/fstab || { warn "无 /etc/fstab"; return 0; }
+  echo
+  local src mp typ opts dump pass uuid dev found
+  while read -r src mp typ opts dump pass; do
+    [[ -n "$src" ]] || continue
+    found=0
+    case "$src" in
+      UUID=*|uuid=*)
+        uuid="${src#*=}"
+        if [[ -e "/dev/disk/by-uuid/$uuid" ]]; then found=1; dev="$(readlink -f "/dev/disk/by-uuid/$uuid" 2>/dev/null || true)"
+        elif has_cmd blkid && blkid | grep -q "UUID=\"$uuid\""; then found=1; fi
+        ;;
+      LABEL=*|label=*)
+        if [[ -e "/dev/disk/by-label/${src#*=}" ]]; then found=1; fi
+        ;;
+      /*)
+        [[ -e "$src" ]] && found=1
+        ;;
+      *)
+        found=1
+        ;;
+    esac
+    if [[ "$found" -eq 1 ]]; then printf '  [OK]   %-30s -> %s\n' "$src" "$mp"
+    else printf '  [MISS] %-30s -> %s  （设备不存在，开机可能失败）\n' "$src" "$mp"; fi
+    if [[ "$mp" != none && "$mp" != swap && ! -d "$mp" ]]; then warn "挂载点目录不存在：$mp"; fi
+  done < <(awk '$1 !~ /^#/ && NF>=2 {print $1,$2,$3,$4,$5,$6}' /etc/fstab)
+  section "重复挂载点"
+  awk '$1 !~ /^#/ && NF>=2 && $2!="none" {print $2}' /etc/fstab | sort | uniq -d | grep -n . && warn "存在重复挂载点" || echo "(无)"
+}
+disk_grow() {
+  ensure_linux_only "macOS 不支持此 Linux 文件系统扩容。"
+  local target="${1:-}" src fstype mp dev
+  [[ -n "$target" ]] || target="$(need_arg target "" "挂载点或设备，如 /data 或 /dev/sdb1: ")"
+  [[ -n "$target" ]] || cancelled
+  if [[ -d "$target" ]]; then
+    mp="$target"
+    src="$(findmnt -n -o SOURCE --target "$mp" 2>/dev/null || true)"
+    fstype="$(findmnt -n -o FSTYPE --target "$mp" 2>/dev/null || true)"
+  elif [[ -b "$target" ]]; then
+    src="$target"
+    mp="$(findmnt -n -o TARGET "$src" 2>/dev/null || true)"
+    fstype="$(findmnt -n -o FSTYPE "$src" 2>/dev/null || blkid -o value -s TYPE "$src" 2>/dev/null || true)"
+  else
+    fatal "不是挂载点或块设备：$target"
+  fi
+  [[ -n "$src" ]] || fatal "无法解析设备"
+  [[ -n "$fstype" ]] || fatal "无法识别文件系统类型"
+  info "设备=$src  挂载点=${mp:-未挂载}  类型=$fstype"
+  warn "本操作只把文件系统扩到当前分区/LV 已有容量，不会改分区表。"
+  confirm "即将扩容文件系统 ${src}（${fstype}）。是否继续？" || cancelled
+  case "$fstype" in
+    xfs) has_cmd xfs_growfs || pkg_install xfsprogs; [[ -n "$mp" ]] || fatal "xfs_growfs 需要挂载点"; run xfs_growfs "$mp" ;;
+    ext2|ext3|ext4) has_cmd resize2fs || pkg_install e2fsprogs; run resize2fs "$src" ;;
+    btrfs) has_cmd btrfs || fatal "缺少 btrfs 工具"; [[ -n "$mp" ]] || fatal "btrfs 需要挂载点"; run btrfs filesystem resize max "$mp" ;;
+    *) fatal "暂不支持的文件系统：$fstype" ;;
+  esac
+  df -hT "${mp:-$src}" 2>/dev/null || df -h "$src" || true
+  success "文件系统扩容完成。"
+}
+disk_large() {
+  local path="${1:-/}" n="${2:-15}"
+  [[ -d "$path" ]] || fatal "目录不存在：$path"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=15
+  section "${path} 下较大目录 / 文件 Top ${n}"
+  if has_cmd du; then
+    du -x -h --max-depth=2 "$path" 2>/dev/null | sort -hr | head -n "$n" || du -h -d 2 "$path" 2>/dev/null | sort -hr | head -n "$n" || true
+  fi
+  if has_cmd find; then
+    section "大文件（>200M）"
+    find "$path" -xdev -type f -size +200M -printf '%s\t%p\n' 2>/dev/null | sort -nr | head -n "$n" | awk '{printf "%.1fG\t%s\n", $1/1024/1024/1024, $2}' || true
+  fi
+}
+disk_deleted() {
+  ensure_linux_only "macOS 请用 lsof 手工排查已删占用。"
+  section "已删除但仍被进程占用的文件"
+  if has_cmd lsof; then
+    lsof +L1 2>/dev/null | head -n 40 || lsof 2>/dev/null | grep -i deleted | head -n 40 || echo "(无或无权)"
+  else
+    warn "未安装 lsof"
+  fi
+}
+disk_inode() {
+  section "inode 使用"
+  df -hi -x tmpfs -x devtmpfs 2>/dev/null || df -i
+}
+
+# ---------- 进程与资源 proc ----------
+proc_top() {
+  local sort="${1:-cpu}" n=15
+  case "$sort" in
+    cpu|"") section "CPU Top ${n}"; ps aux --sort=-%cpu 2>/dev/null | head -n $((n+1)) || ps aux | head -n $((n+1)) ;;
+    mem) section "内存 Top ${n}"; ps aux --sort=-%mem 2>/dev/null | head -n $((n+1)) || ps aux | head -n $((n+1)) ;;
+    fd)
+      section "打开文件数 Top ${n}"
+      if [[ -d /proc ]]; then
+        local d pid cnt comm
+        for d in /proc/[0-9]*; do
+          pid="${d#/proc/}"
+          cnt="$(ls "$d/fd" 2>/dev/null | wc -l | tr -d ' ')"
+          comm="$(cat "$d/comm" 2>/dev/null || echo '?')"
+          printf '%6s %6s %s\n' "$cnt" "$pid" "$comm"
+        done | sort -nr | head -n "$n" | awk '{printf "fd=%-6s pid=%-6s %s\n", $1,$2,$3}'
+      else warn "无 /proc，无法统计 fd"; fi
+      ;;
+    io)
+      section "磁盘 IO 粗览"
+      if has_cmd iotop; then warn "交互 iotop 请直接运行 iotop；下面是 pidstat/iotop 快照（若可用）。"; fi
+      has_cmd pidstat && pidstat -d 1 1 2>/dev/null | head -n 20 || true
+      if [[ -r /proc/diskstats ]]; then awk '{printf "%s r=%s w=%s\n", $3,$6,$10}' /proc/diskstats | head -n 20; fi
+      ;;
+    *) fatal "未知排序：$sort（cpu|mem|fd|io）" ;;
+  esac
+}
+proc_port() {
+  local port="${1:-}"
+  [[ -n "$port" ]] || port="$(need_arg port "" "端口: ")"
+  net_who "$port"
+}
+proc_files() {
+  local target="${1:-}"
+  [[ -n "$target" ]] || target="$(need_arg target "" "PID 或文件/目录路径: ")"
+  [[ -n "$target" ]] || cancelled
+  has_cmd lsof || { pkg_install lsof || true; }
+  has_cmd lsof || fatal "未找到 lsof"
+  if [[ "$target" =~ ^[0-9]+$ ]]; then run lsof -nP -p "$target" | head -n 60
+  else run lsof -nP "$target" | head -n 60; fi
+}
+proc_kill() {
+  local pid="${1:-}" sig="${2:-TERM}"
+  [[ -n "$pid" ]] || pid="$(need_arg pid "" "PID: ")"
+  [[ "$pid" =~ ^[0-9]+$ ]] || fatal "非法 PID：$pid"
+  [[ "$sig" =~ ^[A-Z0-9]+$ ]] || fatal "非法信号：$sig"
+  [[ "$pid" != "1" ]] || fatal "拒绝向 PID 1 发信号。"
+  ps -p "$pid" -o pid,user,stat,etime,cmd || fatal "进程不存在：$pid"
+  confirm "即将向 PID ${pid} 发送 SIG${sig}。是否继续？" || cancelled
+  run kill -s "$sig" "$pid"
+  success "已向 ${pid} 发送 SIG${sig}。"
+}
+proc_cgroup() {
+  local pid="${1:-}"
+  if [[ -z "$pid" ]]; then
+    section "本机 cgroup / 容器线索"
+    [[ -f /proc/1/cgroup ]] && { echo "PID1 cgroup:"; tail -n 5 /proc/1/cgroup; } || true
+    if has_cmd systemd-cgls; then systemd-cgls --no-pager 2>/dev/null | head -n 40 || true; fi
+    return 0
+  fi
+  [[ "$pid" =~ ^[0-9]+$ ]] || fatal "非法 PID：$pid"
+  [[ -d "/proc/$pid" ]] || fatal "进程不存在：$pid"
+  section "PID $pid"
+  ps -p "$pid" -o pid,ppid,user,stat,etime,%cpu,%mem,cmd || true
+  echo "cgroup:"; cat "/proc/$pid/cgroup" 2>/dev/null || true
+  echo "ns:"; ls -l "/proc/$pid/ns" 2>/dev/null || true
+}
+proc_report() {
+  section "为什么可能慢 / 资源简报"
+  echo "负载：$(uptime)"
+  echo "CPU：$(cpu_count) 核"
+  if is_linux && [[ -r /proc/stat ]]; then
+    awk '/^cpu /{u=$2+$4; t=$2+$3+$4+$5+$6+$7+$8; i=$5; w=$6; s=$7; printf "粗算 idle 字段=%s iowait=%s steal=%s（单次采样，仅供参考）\n", i,w,s}' /proc/stat
+  fi
+  echo
+  free -h 2>/dev/null || true
+  echo
+  df -hT 2>/dev/null | head -n 15 || true
+  echo
+  proc_top cpu
+  echo
+  proc_top mem
+  if is_linux; then
+    echo
+    section "最近 OOM"
+    journalctl -k --since '7 days ago' --no-pager 2>/dev/null | grep -iE 'Out of memory|Killed process' | tail -n 10 || echo "(无)"
+    echo
+    section "D 状态 / 僵尸"
+    ps -eo pid,stat,wchan:16,cmd | awk 'NR==1 || $2 ~ /Z/ || $2 ~ /^D/' | head -n 20
+  fi
+}
+
 # ---------- 菜单 ----------
 menu_clear() { [[ -t 1 ]] && clear || true; }
 menu_invalid() { warn "无效选择，请重新输入。"; sleep 1; }
@@ -1743,6 +2852,108 @@ menu_system_update() { local c; while true; do menu_clear; cat <<'EOF_MENU'
 0) 返回上一级
 EOF_MENU
 read -r -p "选择: " c; case "${c:-}" in 1) menu_action "检查更新" system_update_check ;; 2) menu_action "安装安全更新" system_update_security ;; 3) menu_action "更新所有包" system_update_all ;; 0) return ;; *) menu_invalid ;; esac; done; }
+menu_health() { local c; while true; do menu_clear; cat <<'EOF_MENU'
+[主机巡检]
+1) 执行巡检
+2) 生成巡检报告并保存
+0) 返回上一级
+EOF_MENU
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "主机巡检" health_check ;; 2) menu_action "生成巡检报告" health_report ;; 0) return ;; *) menu_invalid ;; esac; done; }
+menu_user() { local c; while true; do menu_clear; cat <<'EOF_MENU'
+[用户与 SSH]
+1) 列出用户 / sudo / 空密码 / UID 0
+2) 查看用户详情
+3) 创建用户
+4) 锁定用户
+5) 解锁用户
+6) 设置账号过期
+7) 授予 sudo
+8) 取消 toolkit sudo
+9) 列出公钥
+10) 添加公钥
+11) 删除公钥
+12) SSH 配置审计
+13) 应用 SSH 安全基线
+0) 返回上一级
+EOF_MENU
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "列出用户" user_list ;; 2) menu_action "用户详情" user_info ;; 3) menu_action "创建用户" user_add ;; 4) menu_action "锁定用户" user_lock ;; 5) menu_action "解锁用户" user_unlock ;; 6) menu_action "设置过期" user_expire ;; 7) menu_action "授予 sudo" user_sudo_add ;; 8) menu_action "取消 sudo" user_sudo_del ;; 9) menu_action "列出公钥" user_keys ;; 10) menu_action "添加公钥" user_key_add ;; 11) menu_action "删除公钥" user_key_del ;; 12) menu_action "SSH 审计" ssh_harden_audit ;; 13) menu_action "SSH 加固" ssh_harden_apply ;; 0) return ;; *) menu_invalid ;; esac; done; }
+menu_cron() { local c; while true; do menu_clear; cat <<'EOF_MENU'
+[定时任务]
+1) 查看某用户 crontab
+2) 查看系统 cron（/etc/cron*）
+3) 查看 systemd timers
+4) 查看全部
+5) 追加 crontab 行
+6) 删除 crontab 行
+7) 备份 crontab
+8) 恢复 crontab
+0) 返回上一级
+EOF_MENU
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "用户 crontab" cron_list ;; 2) menu_action "系统 cron" cron_list system ;; 3) menu_action "systemd timers" cron_timers ;; 4) menu_action "全部定时任务" cron_list all ;; 5) menu_action "追加 crontab" cron_add ;; 6) menu_action "删除 crontab" cron_remove ;; 7) menu_action "备份 crontab" cron_backup ;; 8) menu_action "恢复 crontab" cron_restore ;; 0) return ;; *) menu_invalid ;; esac; done; }
+menu_log() { local c; while true; do menu_clear; cat <<'EOF_MENU'
+[日志与排障]
+1) 查看 journal（按单元/优先级/时间）
+2) 最近关键事件（OOM/IO/重启/登录失败）
+3) 在 /var/log 搜索关键词
+4) 打包故障现场
+0) 返回上一级
+EOF_MENU
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "查看 journal" log_journal ;; 2) menu_action "关键事件" log_events ;; 3) menu_action "日志搜索" log_search ;; 4) menu_action "打包现场" log_collect ;; 0) return ;; *) menu_invalid ;; esac; done; }
+menu_net() { local c; while true; do menu_clear; cat <<'EOF_MENU'
+[网络诊断]
+1) 本机地址 / 路由 / DNS
+2) 监听端口
+3) 查看端口占用
+4) DNS 解析
+5) ping
+6) TCP 端口探测
+7) 路由 / traceroute
+0) 返回上一级
+EOF_MENU
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "网络信息" net_info ;; 2) menu_action "监听端口" net_listen ;; 3) menu_action "端口占用" net_who ;; 4) menu_action "DNS 解析" net_dns ;; 5) menu_action "ping" net_ping ;; 6) menu_action "TCP 探测" net_probe ;; 7) menu_action "路由" net_route ;; 0) return ;; *) menu_invalid ;; esac; done; }
+menu_sysconf() { local c; while true; do menu_clear; cat <<'EOF_MENU'
+[系统配置]
+1) 主机名
+2) 时区
+3) 查看时间 / 同步状态
+4) 启用时间同步
+5) 查看 /etc/hosts
+6) 添加 hosts 记录
+7) 删除 hosts 记录
+8) 查看常用 sysctl
+9) 临时设置 sysctl
+10) 持久化 sysctl
+11) 查看 limits
+12) 设置 limits
+0) 返回上一级
+EOF_MENU
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "主机名" sysconf_hostname ;; 2) menu_action "时区" sysconf_timezone ;; 3) menu_action "时间状态" sysconf_time ;; 4) menu_action "启用 NTP" sysconf_ntp enable ;; 5) menu_action "查看 hosts" sysconf_hosts list ;; 6) menu_action "添加 hosts" sysconf_hosts add ;; 7) menu_action "删除 hosts" sysconf_hosts del ;; 8) menu_action "sysctl 列表" sysconf_sysctl list ;; 9) menu_action "临时 sysctl" sysconf_sysctl set ;; 10) menu_action "持久化 sysctl" sysconf_sysctl persist ;; 11) menu_action "查看 limits" sysconf_limits show ;; 12) menu_action "设置 limits" sysconf_limits set ;; 0) return ;; *) menu_invalid ;; esac; done; }
+menu_disk() { local c; while true; do menu_clear; cat <<'EOF_MENU'
+[磁盘与文件系统]
+1) 磁盘 / 挂载一览
+2) SMART 健康
+3) 检查 fstab
+4) 扩容文件系统（非 LVM）
+5) 大目录 / 大文件
+6) 已删除但仍占用空间
+7) inode 使用
+0) 返回上一级
+EOF_MENU
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "磁盘一览" disk_list ;; 2) menu_action "SMART" disk_smart ;; 3) menu_action "检查 fstab" disk_fstab ;; 4) menu_action "扩容文件系统" disk_grow ;; 5) menu_action "大文件" disk_large ;; 6) menu_action "已删占用" disk_deleted ;; 7) menu_action "inode" disk_inode ;; 0) return ;; *) menu_invalid ;; esac; done; }
+menu_proc() { local c; while true; do menu_clear; cat <<'EOF_MENU'
+[进程与资源]
+1) CPU Top
+2) 内存 Top
+3) 打开文件数 Top
+4) IO 粗览
+5) 端口对应进程
+6) 文件/PID 占用
+7) 向进程发信号
+8) 查看 cgroup / 容器归属
+9) 资源简报（为什么可能慢）
+0) 返回上一级
+EOF_MENU
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "CPU Top" proc_top cpu ;; 2) menu_action "内存 Top" proc_top mem ;; 3) menu_action "fd Top" proc_top fd ;; 4) menu_action "IO" proc_top io ;; 5) menu_action "端口进程" proc_port ;; 6) menu_action "文件占用" proc_files ;; 7) menu_action "kill" proc_kill ;; 8) menu_action "cgroup" proc_cgroup ;; 9) menu_action "资源简报" proc_report ;; 0) return ;; *) menu_invalid ;; esac; done; }
 main_menu() { local c; while true; do menu_clear; cat <<EOF_MENU
 Linux/macOS Admin Toolkit v${TOOL_VERSION}
 系统：${OS_NAME} (${PLATFORM:-unknown})    包管理器：${PKG_MANAGER:-unknown}$( [[ "$DRY_RUN" -eq 1 ]] && printf '    [dry-run 模式：只打印不执行]' )
@@ -1759,9 +2970,17 @@ Linux/macOS Admin Toolkit v${TOOL_VERSION}
 10) SSL 证书检查
 11) 系统更新
 12) 查看系统环境
+13) 主机巡检
+14) 用户与 SSH
+15) 定时任务
+16) 日志与排障
+17) 网络诊断
+18) 系统配置（主机名/时区/hosts/sysctl）
+19) 磁盘与文件系统
+20) 进程与资源
 0) 退出
 EOF_MENU
-read -r -p "请选择: " c; case "${c:-}" in 1) menu_common_tools ;; 2) menu_mirror ;; 3) menu_docker ;; 4) menu_firewall ;; 5) menu_swap ;; 6) menu_lvm ;; 7) menu_perf ;; 8) menu_service ;; 9) menu_disk_cleanup ;; 10) menu_ssl ;; 11) menu_system_update ;; 12) menu_action "查看系统环境" print_env ;; 0) exit 0 ;; *) menu_invalid ;; esac; done; }
+read -r -p "请选择: " c; case "${c:-}" in 1) menu_common_tools ;; 2) menu_mirror ;; 3) menu_docker ;; 4) menu_firewall ;; 5) menu_swap ;; 6) menu_lvm ;; 7) menu_perf ;; 8) menu_service ;; 9) menu_disk_cleanup ;; 10) menu_ssl ;; 11) menu_system_update ;; 12) menu_action "查看系统环境" print_env ;; 13) menu_health ;; 14) menu_user ;; 15) menu_cron ;; 16) menu_log ;; 17) menu_net ;; 18) menu_sysconf ;; 19) menu_disk ;; 20) menu_proc ;; 0) exit 0 ;; *) menu_invalid ;; esac; done; }
 
 # ---------- CLI ----------
 usage() { cat <<EOF_USAGE
@@ -1788,6 +3007,17 @@ usage() { cat <<EOF_USAGE
   ssl-check    <域名> [端口]（默认 443）
   ssl-check-batch <文件>
   system-update check | security | all
+  health       check | report [--out 文件]
+  user         list | info <用户> | add <用户> [--groups g] [--shell /bin/bash] | lock | unlock | expire <用户> [YYYY-MM-DD]
+               sudo-add | sudo-del | keys | key-add <用户> [公钥|文件] | key-del <用户> <行号|关键词>
+  ssh-harden   audit | apply [--no-root-login] [--no-password] [--port N] [--allow-users u1,u2]
+  cron         list [用户|system|timers|all] | add [用户] [行] | remove [用户] [行号|关键词] | backup [用户|all] | restore <文件> [用户] | timers
+  log          journal [单元] [优先级] [since] [行数] | events [小时] | search <关键词> [路径] | collect [--hours N] [--out 文件]
+  net          info | listen [端口] | who <端口> | dns [域名] | ping <主机> | probe <host:port> | route [目标]
+  sysconf      hostname [名称] | timezone [区] | time | ntp [status|enable] | hosts [list|add <ip> <名>|del <名>]
+               sysctl [list|set key=val|persist key=val] | limits [show|set <项> <值>]
+  disk         list | smart [设备] | fstab | grow <挂载点|设备> | large [路径] [条数] | deleted | inode
+  proc         top [cpu|mem|fd|io] | port <端口> | files <PID|路径> | kill <PID> [信号] | cgroup [PID] | report
 
 模块示例：
   $PROGRAM_NAME menu
@@ -1828,6 +3058,27 @@ usage() { cat <<EOF_USAGE
   $PROGRAM_NAME system-update check
   $PROGRAM_NAME system-update security
   $PROGRAM_NAME system-update all
+  $PROGRAM_NAME health check
+  $PROGRAM_NAME health report --out /tmp/health.txt
+  $PROGRAM_NAME user list
+  $PROGRAM_NAME user add deploy --groups docker,sudo
+  $PROGRAM_NAME user key-add deploy ~/.ssh/id_ed25519.pub
+  $PROGRAM_NAME ssh-harden audit
+  $PROGRAM_NAME ssh-harden apply --no-root-login --no-password
+  $PROGRAM_NAME cron list all
+  $PROGRAM_NAME cron add root '0 3 * * * /usr/local/bin/backup.sh'
+  $PROGRAM_NAME log events 24
+  $PROGRAM_NAME log collect --hours 2 --out /tmp/incident.tgz
+  $PROGRAM_NAME net info
+  $PROGRAM_NAME net probe 1.1.1.1:443
+  $PROGRAM_NAME sysconf hostname web-01
+  $PROGRAM_NAME sysconf timezone Asia/Shanghai
+  $PROGRAM_NAME sysconf sysctl persist vm.swappiness=10
+  $PROGRAM_NAME disk list
+  $PROGRAM_NAME disk fstab
+  $PROGRAM_NAME disk grow /data
+  $PROGRAM_NAME proc top mem
+  $PROGRAM_NAME proc report
 EOF_USAGE
 }
 get_opt_value() { local key="$1" arg next; shift || true; while [[ "$#" -gt 0 ]]; do arg="$1"; case "$arg" in "$key") shift || true; next="${1:-}"; [[ -n "$next" && "$next" != -* ]] || return 1; printf '%s' "$next"; return 0 ;; "$key"=*) printf '%s' "${arg#*=}"; return 0 ;; esac; shift || true; done; return 1; }
@@ -1972,6 +3223,112 @@ cmd_system_update() {
     *) fatal "未知 system-update 动作：${action:-}。支持：check/security/all" ;;
   esac
 }
+cmd_health() {
+  local action="${2:-check}"
+  case "$action" in
+    check) health_check ;;
+    report) health_report "$(get_opt_value --out "$@" || true)" ;;
+    *) fatal "未知 health 动作：${action:-}。支持：check/report" ;;
+  esac
+}
+cmd_user() {
+  local action="${2:-list}"
+  case "$action" in
+    list) user_list ;;
+    info) user_info "${3:-}" ;;
+    add) user_add "${3:-}" "$(get_opt_value --groups "$@" || true)" "$(get_opt_value --shell "$@" || printf /bin/bash)" ;;
+    lock) user_lock "${3:-}" ;;
+    unlock) user_unlock "${3:-}" ;;
+    expire) user_expire "${3:-}" "${4:-}" ;;
+    sudo-add) user_sudo_add "${3:-}" ;;
+    sudo-del) user_sudo_del "${3:-}" ;;
+    keys) user_keys "${3:-}" ;;
+    key-add) user_key_add "${3:-}" "${4:-}" ;;
+    key-del) user_key_del "${3:-}" "${4:-}" ;;
+    *) fatal "未知 user 动作：${action:-}。支持：list/info/add/lock/unlock/expire/sudo-add/sudo-del/keys/key-add/key-del" ;;
+  esac
+}
+cmd_ssh_harden() {
+  local action="${2:-audit}"
+  case "$action" in
+    audit) ssh_harden_audit ;;
+    apply) shift 2 || true; ssh_harden_apply "$@" ;;
+    *) fatal "未知 ssh-harden 动作：${action:-}。支持：audit/apply" ;;
+  esac
+}
+cmd_cron() {
+  local action="${2:-list}"
+  case "$action" in
+    list) cron_list "${3:-}" ;;
+    add) cron_add "${3:-}" "${4:-}" ;;
+    remove|del|rm) cron_remove "${3:-}" "${4:-}" ;;
+    backup) cron_backup "${3:-}" ;;
+    restore) cron_restore "${3:-}" "${4:-}" ;;
+    timers|timer) cron_timers ;;
+    *) fatal "未知 cron 动作：${action:-}。支持：list/add/remove/backup/restore/timers" ;;
+  esac
+}
+cmd_log() {
+  local action="${2:-events}"
+  case "$action" in
+    journal) log_journal "${3:-}" "${4:-}" "${5:-}" "${6:-100}" ;;
+    events) log_events "${3:-24}" ;;
+    search) log_search "${3:-}" "${4:-/var/log}" ;;
+    collect) log_collect "$(get_opt_value --hours "$@" || printf 2)" "$(get_opt_value --out "$@" || true)" ;;
+    *) fatal "未知 log 动作：${action:-}。支持：journal/events/search/collect" ;;
+  esac
+}
+cmd_net() {
+  local action="${2:-info}"
+  case "$action" in
+    info) net_info ;;
+    listen) net_listen "${3:-}" ;;
+    who) net_who "${3:-}" ;;
+    dns) net_dns "${3:-}" ;;
+    ping) net_ping "${3:-}" ;;
+    probe) net_probe "${3:-}" ;;
+    route) net_route "${3:-}" ;;
+    *) fatal "未知 net 动作：${action:-}。支持：info/listen/who/dns/ping/probe/route" ;;
+  esac
+}
+cmd_sysconf() {
+  local action="${2:-}"
+  case "$action" in
+    hostname) sysconf_hostname "${3:-}" ;;
+    timezone|tz) sysconf_timezone "${3:-}" ;;
+    time) sysconf_time ;;
+    ntp) sysconf_ntp "${3:-status}" ;;
+    hosts) sysconf_hosts "${3:-list}" "${4:-}" "${5:-}" ;;
+    sysctl) sysconf_sysctl "${3:-list}" "${4:-}" ;;
+    limits) sysconf_limits "${3:-show}" "${4:-}" "${5:-}" ;;
+    *) fatal "未知 sysconf 动作：${action:-}。支持：hostname/timezone/time/ntp/hosts/sysctl/limits" ;;
+  esac
+}
+cmd_disk() {
+  local action="${2:-list}"
+  case "$action" in
+    list) disk_list ;;
+    smart) disk_smart "${3:-}" ;;
+    fstab) disk_fstab ;;
+    grow) disk_grow "${3:-}" ;;
+    large) disk_large "${3:-/}" "${4:-15}" ;;
+    deleted) disk_deleted ;;
+    inode) disk_inode ;;
+    *) fatal "未知 disk 动作：${action:-}。支持：list/smart/fstab/grow/large/deleted/inode" ;;
+  esac
+}
+cmd_proc() {
+  local action="${2:-report}"
+  case "$action" in
+    top) proc_top "${3:-cpu}" ;;
+    port) proc_port "${3:-}" ;;
+    files) proc_files "${3:-}" ;;
+    kill) proc_kill "${3:-}" "${4:-TERM}" ;;
+    cgroup) proc_cgroup "${3:-}" ;;
+    report) proc_report ;;
+    *) fatal "未知 proc 动作：${action:-}。支持：top/port/files/kill/cgroup/report" ;;
+  esac
+}
 main() {
   detect_os; load_config; audit_log "START: $0 $*"
   local module="${1:-menu}" rest=()
@@ -1996,9 +3353,18 @@ main() {
     shift
   done
   set -- "${rest[@]}"
-  # 权限统一：查询类模块（env/perf/ssl-check）无需 root，其余需要
+  # 权限统一：纯查询类无需 root，变更类需要
   case "$module" in
-    env|perf|ssl-check|ssl-check-batch) : ;;
+    env|perf|ssl-check|ssl-check-batch|health|net) : ;;
+    log)
+      case "${1:-}" in collect) require_root "$@" ;; *) : ;; esac
+      ;;
+    proc)
+      case "${1:-}" in kill) require_root "$@" ;; *) : ;; esac
+      ;;
+    disk)
+      case "${1:-}" in grow|smart) require_root "$@" ;; *) : ;; esac
+      ;;
     *) require_root "$@" ;;
   esac
   case "$module" in
@@ -2017,6 +3383,15 @@ main() {
     ssl-check) ssl_check "${1:-}" "${2:-443}" ;;
     ssl-check-batch) ssl_check_batch "${1:-}" ;;
     system-update) cmd_system_update "$module" "$@" ;;
+    health) cmd_health "$module" "$@" ;;
+    user) cmd_user "$module" "$@" ;;
+    ssh-harden) cmd_ssh_harden "$module" "$@" ;;
+    cron) cmd_cron "$module" "$@" ;;
+    log) cmd_log "$module" "$@" ;;
+    net) cmd_net "$module" "$@" ;;
+    sysconf) cmd_sysconf "$module" "$@" ;;
+    disk) cmd_disk "$module" "$@" ;;
+    proc) cmd_proc "$module" "$@" ;;
     *) usage; fatal "未知模块：${module}" ;;
   esac
 }

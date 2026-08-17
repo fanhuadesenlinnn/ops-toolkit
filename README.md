@@ -2,14 +2,14 @@
 
 `ops-toolkit` 是一组面向日常运维的 Bash 小工具，目标是把常见、重复、容易出错的服务器管理操作整理成可复用命令。
 
-当前仓库包含 SSH 主机管理、Linux/macOS 基础运维、软件源、Docker、防火墙、Swap/LVM 和性能排查相关脚本。脚本默认尽量给出确认提示，也支持 `--dry-run` 预览高影响操作。
+当前仓库包含 SSH 主机管理、Linux/macOS 基础运维、软件源、Docker、防火墙、Swap/LVM、性能排查，以及主机巡检、用户/SSH、定时任务、日志、网络、系统配置、磁盘和进程相关脚本。脚本默认尽量给出确认提示，也支持 `--dry-run` 预览高影响操作。
 
 ## 脚本清单
 
 | 脚本 | 用途 | 状态 |
 | --- | --- | --- |
 | [`sshm.sh`](./sshm.sh) | SSH 主机管理脚本，支持保存主机、按别名或 ID 连接、增删改查、搜索和备注。 | 可用 |
-| [`linux-admin-toolkit.sh`](./linux-admin-toolkit.sh) | Linux/macOS 运维工具箱，覆盖常用工具安装、软件源、Docker、防火墙、Swap/LVM 和性能排查。内含 `docker-offline` 模块支持离线二进制安装。 | 可用 |
+| [`linux-admin-toolkit.sh`](./linux-admin-toolkit.sh) | Linux/macOS 运维工具箱，覆盖常用工具安装、软件源、Docker、防火墙、Swap/LVM、性能排查、主机巡检、用户/SSH、定时任务、日志、网络、系统配置、磁盘和进程。内含 `docker-offline` 模块支持离线二进制安装。 | 可用 |
 | [`install-docker-offline.sh`](./install-docker-offline.sh) | Docker 离线二进制独立安装脚本（功能已合并到 toolkit）；支持下载/安装/卸载/打包。 | 可用 |
 | [`lvm-manager.sh`](./lvm-manager.sh) | LVM 管理脚本，支持 PV/VG/LV 创建、扩容、删除、查询，自动挂载与 fstab 管理，支持 `--dry-run` 预览。 | 可用 |
 
@@ -90,6 +90,7 @@ alias,user,host,port,identity,note
 - 安装 Docker、配置镜像加速、导出镜像和查看 Docker 状态。
 - 管理防火墙、Swap 和 LVM。
 - 快速查看系统环境并执行基础性能瓶颈排查。
+- 主机巡检、用户与 SSH 基线、定时任务、日志打包、网络诊断、系统配置、非 LVM 磁盘和进程排查。
 - 支持 `--dry-run` 预览命令，适合在生产环境执行前确认影响。
 
 常用命令：
@@ -115,6 +116,25 @@ alias,user,host,port,identity,note
 ./linux-admin-toolkit.sh lvm delete -d /dev/sdc                    # 删 PV
 ./linux-admin-toolkit.sh lvm sizes                # 大小格式说明 (100G/+50G/100%FREE/max)
 ./linux-admin-toolkit.sh perf quick
+./linux-admin-toolkit.sh health check
+./linux-admin-toolkit.sh health report --out /tmp/health.txt
+./linux-admin-toolkit.sh user list
+./linux-admin-toolkit.sh user add deploy --groups docker,sudo
+./linux-admin-toolkit.sh user key-add deploy ~/.ssh/id_ed25519.pub
+./linux-admin-toolkit.sh ssh-harden audit
+./linux-admin-toolkit.sh --dry-run ssh-harden apply --no-root-login --no-password
+./linux-admin-toolkit.sh cron list all
+./linux-admin-toolkit.sh log events 24
+./linux-admin-toolkit.sh log collect --hours 2 --out /tmp/incident.tgz
+./linux-admin-toolkit.sh net info
+./linux-admin-toolkit.sh net probe 1.1.1.1:443
+./linux-admin-toolkit.sh sysconf hostname web-01
+./linux-admin-toolkit.sh sysconf timezone Asia/Shanghai
+./linux-admin-toolkit.sh disk list
+./linux-admin-toolkit.sh disk fstab
+./linux-admin-toolkit.sh disk grow /data
+./linux-admin-toolkit.sh proc top mem
+./linux-admin-toolkit.sh proc report
 ```
 
 全局选项：
@@ -150,6 +170,21 @@ alias,user,host,port,identity,note
 ```
 
 离线安装模块支持的选项：`--resource-dir`、`--docker-version`、`--compose-version`、`--arch`、`--download-if-missing`、`--skip-docker`、`--skip-compose`、`--no-start`、`--no-enable`、`--data-root`、`--registry-mirror`、`--docker-channel`、`--package-file`、`--purge-data`。
+
+### 日常运维模块
+
+这些模块面向单机日常操作，高危变更会先确认，并支持 `--dry-run`。
+
+| 模块 | 用途 |
+| --- | --- |
+| `health` | 主机巡检：负载、内存、磁盘/inode、只读挂载、僵尸/D 进程、OOM、失败服务、时间同步、网关/DNS。可输出报告。 |
+| `user` / `ssh-harden` | 用户增删锁、sudo、authorized_keys；SSH 配置审计与基线（禁空密码、可选禁 root/密码登录）。改 sshd 前备份并 `sshd -t`。 |
+| `cron` | 查看用户 crontab、`/etc/cron*`、systemd timer；追加/删除、备份/恢复。 |
+| `log` | journal 查询、最近 OOM/IO/panic/登录失败、日志关键词搜索、故障现场打包。 |
+| `net` | 地址/路由/DNS、监听端口、端口占用、ping、TCP 探测、traceroute。 |
+| `sysconf` | 主机名、时区、NTP、`/etc/hosts`、sysctl、limits。 |
+| `disk` | 非 LVM：磁盘一览、SMART、fstab 检查、文件系统扩容、大文件、已删占用、inode。 |
+| `proc` | CPU/内存/fd/IO Top、端口对应进程、文件占用、安全 kill、cgroup、资源简报。 |
 
 ## lvm-manager.sh
 
