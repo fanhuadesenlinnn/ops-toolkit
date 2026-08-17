@@ -9,7 +9,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 PROGRAM_NAME="$(basename "$0")"
-TOOL_VERSION="0.4.0"
+TOOL_VERSION="0.5.0"
 ASSUME_YES=0
 DRY_RUN=0
 NO_COLOR=0
@@ -72,7 +72,7 @@ cmd_path() { local cmd="${1:-}" d; [[ -n "$cmd" ]] || return 1; command -v "$cmd
 has_cmd() { cmd_path "${1:-}" >/dev/null 2>&1; }
 trim_string() { local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
 has_unsafe_url_chars() { local v="${1:-}"; [[ "$v" == *"'"* || "$v" == *\"* || "$v" == *"\`"* || "$v" == *"\\"* || "$v" == *";"* || "$v" == *"|"* || "$v" =~ [[:space:]] ]]; }
-confirm() { local prompt="${1:-确认继续？}" ans; [[ "$ASSUME_YES" -eq 1 ]] && return 0; echo >&2; echo "$prompt" >&2; echo "1) 是，继续" >&2; echo "2) 否，取消" >&2; read -r -p "请选择 [2]: " ans; case "${ans:-}" in 1|y|Y|yes|YES|Yes) return 0 ;; *) return 1 ;; esac; }
+confirm() { local prompt="${1:-确认继续？}" ans; [[ "$ASSUME_YES" -eq 1 ]] && return 0; [[ "$DRY_RUN" -eq 1 ]] && return 0; echo >&2; echo "$prompt" >&2; echo "1) 是，继续" >&2; echo "2) 否，取消" >&2; read -r -p "请选择 [2]: " ans; case "${ans:-}" in 1|y|Y|yes|YES|Yes) return 0 ;; *) return 1 ;; esac; }
 cancelled() { warn "用户取消操作。"; return "$CANCEL_RC"; }
 skipped() { warn "$*"; return "$SKIP_RC"; }
 not_applicable() { skipped "$*"; }
@@ -131,7 +131,7 @@ CODENAME：$(get_codename)
 架构：$(uname -m)
 内核：$(uname -r)
 EOF_ENV
-is_macos && { brew_bin >/dev/null 2>&1 && echo "Homebrew：$(brew_bin)" || echo "Homebrew：未安装"; }
+if is_macos; then local brew; brew="$(brew_bin 2>/dev/null || true)"; [[ -n "$brew" ]] && echo "Homebrew：$brew" || echo "Homebrew：未安装"; fi
 return 0
 }
 
@@ -173,10 +173,10 @@ nload:nload
 sysstat:sar
 EOF_TOOLS
 }
-install_common_tools() { if is_macos; then ensure_brew; brew_install curl wget vim git htop tmux zsh unzip jq rsync netcat bind lsof iftop nload || return 1; warn "macOS 的 ping/ifconfig 通常为系统自带；iotop/sysstat 在 macOS 上不可完全等价，脚本不会强制安装。"; verify_common_tools; return $?; fi; case "$PKG_MANAGER" in apt) pkg_install curl wget vim git htop tmux zsh unzip jq rsync netcat-openbsd dnsutils iputils-ping net-tools lsof iotop iftop nload sysstat ;; dnf|yum) pkg_install curl wget vim-enhanced git htop tmux zsh unzip jq rsync nc bind-utils iputils net-tools lsof iotop iftop nload sysstat ;; pacman) pkg_install curl wget vim git htop tmux zsh unzip jq rsync openbsd-netcat bind iputils net-tools lsof iotop iftop nload sysstat ;; *) fatal "未检测到支持的包管理器。" ;; esac; verify_common_tools; }
-verify_common_tools() { local item name cmd missing=""; while IFS= read -r item; do [[ -n "$item" ]] || continue; name="${item%%:*}"; cmd="${item#*:}"; [[ "$cmd" == "$item" ]] && cmd="$name"; if ! has_cmd "$cmd"; then if is_macos && [[ "$name" == "iotop" || "$name" == "sysstat" ]]; then warn "macOS 暂不强制检查 ${name}。"; else missing="${missing}\n  - ${name}"; fi; fi; done < <(common_tool_commands); [[ -n "$missing" ]] && { warn "以下常用工具命令仍然缺失：$(printf '%b' "$missing")"; return 1; }; success "常用工具安装并校验完成。"; }
-tool_status() { local item name cmd missing=0 path; echo "目标用户：$(target_user_name)"; echo "用户目录：$(target_user_home)"; echo; printf '%-18s %s\n' "工具" "状态"; printf '%-18s %s\n' "----" "----"; while IFS= read -r item; do [[ -n "$item" ]] || continue; name="${item%%:*}"; cmd="${item#*:}"; [[ "$cmd" == "$item" ]] && cmd="$name"; if path="$(cmd_path "$cmd" 2>/dev/null)"; then printf '%-18s %s\n' "$name" "已安装 (${path})"; else printf '%-18s %s\n' "$name" "缺失"; missing=$((missing + 1)); fi; done < <(common_tool_commands); echo; [[ "$missing" -gt 0 ]] && warn "缺少 ${missing} 个命令，可先执行 '安装常用工具'。" || success "常用工具命令检测通过。"; }
-configure_vim() { ensure_target_home; local home file; home="$(target_user_home)"; file="$home/.vimrc"; backup_file_if_exists "$file"; write_file "$file" <<'EOF_VIM'
+tools_install() { if is_macos; then ensure_brew; brew_install curl wget vim git htop tmux zsh unzip jq rsync netcat bind lsof iftop nload || return 1; warn "macOS 的 ping/ifconfig 通常为系统自带；iotop/sysstat 在 macOS 上不可完全等价，脚本不会强制安装。"; tools_verify; return $?; fi; case "$PKG_MANAGER" in apt) pkg_install curl wget vim git htop tmux zsh unzip jq rsync netcat-openbsd dnsutils iputils-ping net-tools lsof iotop iftop nload sysstat ;; dnf|yum) pkg_install curl wget vim-enhanced git htop tmux zsh unzip jq rsync nc bind-utils iputils net-tools lsof iotop iftop nload sysstat ;; pacman) pkg_install curl wget vim git htop tmux zsh unzip jq rsync openbsd-netcat bind iputils net-tools lsof iotop iftop nload sysstat ;; *) fatal "未检测到支持的包管理器。" ;; esac; tools_verify; }
+tools_verify() { local item name cmd missing=""; while IFS= read -r item; do [[ -n "$item" ]] || continue; name="${item%%:*}"; cmd="${item#*:}"; [[ "$cmd" == "$item" ]] && cmd="$name"; if ! has_cmd "$cmd"; then if is_macos && [[ "$name" == "iotop" || "$name" == "sysstat" ]]; then warn "macOS 暂不强制检查 ${name}。"; else missing="${missing}\n  - ${name}"; fi; fi; done < <(common_tool_commands); [[ -n "$missing" ]] && { warn "以下常用工具命令仍然缺失：$(printf '%b' "$missing")"; return 1; }; success "常用工具安装并校验完成。"; }
+tools_status() { local item name cmd missing=0 path; echo "目标用户：$(target_user_name)"; echo "用户目录：$(target_user_home)"; echo; printf '%-18s %s\n' "工具" "状态"; printf '%-18s %s\n' "----" "----"; while IFS= read -r item; do [[ -n "$item" ]] || continue; name="${item%%:*}"; cmd="${item#*:}"; [[ "$cmd" == "$item" ]] && cmd="$name"; if path="$(cmd_path "$cmd" 2>/dev/null)"; then printf '%-18s %s\n' "$name" "已安装 (${path})"; else printf '%-18s %s\n' "$name" "缺失"; missing=$((missing + 1)); fi; done < <(common_tool_commands); echo; [[ "$missing" -gt 0 ]] && warn "缺少 ${missing} 个命令，可先执行 '安装常用工具'。" || success "常用工具命令检测通过。"; }
+tools_config_vim() { ensure_target_home; local home file; home="$(target_user_home)"; file="$home/.vimrc"; backup_file_if_exists "$file"; write_file "$file" <<'EOF_VIM'
 set nocompatible
 syntax on
 filetype plugin indent on
@@ -194,7 +194,7 @@ set encoding=utf-8
 set backspace=indent,eol,start
 EOF_VIM
 chown_target "$file"; success "Vim 配置完成。"; }
-configure_tmux() { ensure_target_home; local home file; home="$(target_user_home)"; file="$home/.tmux.conf"; backup_file_if_exists "$file"; write_file "$file" <<'EOF_TMUX'
+tools_config_tmux() { ensure_target_home; local home file; home="$(target_user_home)"; file="$home/.tmux.conf"; backup_file_if_exists "$file"; write_file "$file" <<'EOF_TMUX'
 unbind-key C-b
 set-option -g prefix C-h
 bind-key C-b send-prefix
@@ -215,7 +215,7 @@ set-option -g history-limit 500000
 set-window-option -g mode-keys vi
 EOF_TMUX
 chown_target "$file"; success "Tmux 配置完成。"; }
-configure_git() { ensure_target_home; local home file; home="$(target_user_home)"; file="$home/.gitconfig"; backup_file_if_exists "$file"; write_file "$file" <<'EOF_GIT'
+tools_config_git() { ensure_target_home; local home file; home="$(target_user_home)"; file="$home/.gitconfig"; backup_file_if_exists "$file"; write_file "$file" <<'EOF_GIT'
 [core]
     editor = vim
     autocrlf = input
@@ -227,7 +227,7 @@ configure_git() { ensure_target_home; local home file; home="$(target_user_home)
     ui = auto
 EOF_GIT
 chown_target "$file"; success "Git 基础配置完成。"; }
-configure_zsh_basic() { ensure_target_home; local home zshrc block; home="$(target_user_home)"; zshrc="$home/.zshrc"; block='export EDITOR=vim
+tools_config_zsh_basic() { ensure_target_home; local home zshrc block; home="$(target_user_home)"; zshrc="$home/.zshrc"; block='export EDITOR=vim
 export PAGER=less
 setopt autocd 2>/dev/null || true
 setopt share_history 2>/dev/null || true
@@ -235,52 +235,52 @@ HISTSIZE=10000
 SAVEHIST=10000
 alias ll="ls -alF"
 alias la="ls -A"
-alias l="ls -CF"'; write_managed_block "$zshrc" "zsh-basic" "$block"; success "Zsh 基础配置完成。"; }
-remove_managed_block() { local file="$1" name="$2" begin end tmp; [[ -f "$file" ]] || return 0; [[ "$DRY_RUN" -eq 1 ]] && { info "+ remove managed block '$name' from $file"; return 0; }; begin="# >>> Linux Admin Toolkit: ${name} >>>"; end="# <<< Linux Admin Toolkit: ${name} <<<"; tmp="$(mktemp)"; awk -v b="$begin" -v e="$end" '$0 == b {skip=1; next} $0 == e {skip=0; next} skip != 1 {print}' "$file" > "$tmp"; cat "$tmp" > "$file"; rm -f "$tmp"; }
-write_managed_block() { local file="$1" name="$2" content="$3" dir begin end; dir="$(dirname "$file")"; [[ "$DRY_RUN" -eq 1 ]] && { info "+ write managed block '$name' to $file"; return 0; }; run mkdir -p "$dir"; [[ -f "$file" ]] || run touch "$file"; remove_managed_block "$file" "$name"; begin="# >>> Linux Admin Toolkit: ${name} >>>"; end="# <<< Linux Admin Toolkit: ${name} <<<"; { printf '\n%s\n' "$begin"; printf '%s\n' "$content"; printf '%s\n' "$end"; } | append_file "$file"; chown_target "$file"; }
+alias l="ls -CF"'; tools_write_managed_block "$zshrc" "zsh-basic" "$block"; success "Zsh 基础配置完成。"; }
+tools_remove_managed_block() { local file="$1" name="$2" begin end tmp; [[ -f "$file" ]] || return 0; [[ "$DRY_RUN" -eq 1 ]] && { info "+ remove managed block '$name' from $file"; return 0; }; begin="# >>> Linux Admin Toolkit: ${name} >>>"; end="# <<< Linux Admin Toolkit: ${name} <<<"; tmp="$(mktemp)"; awk -v b="$begin" -v e="$end" '$0 == b {skip=1; next} $0 == e {skip=0; next} skip != 1 {print}' "$file" > "$tmp"; cat "$tmp" > "$file"; rm -f "$tmp"; }
+tools_write_managed_block() { local file="$1" name="$2" content="$3" dir begin end; dir="$(dirname "$file")"; [[ "$DRY_RUN" -eq 1 ]] && { info "+ write managed block '$name' to $file"; return 0; }; run mkdir -p "$dir"; [[ -f "$file" ]] || run touch "$file"; tools_remove_managed_block "$file" "$name"; begin="# >>> Linux Admin Toolkit: ${name} >>>"; end="# <<< Linux Admin Toolkit: ${name} <<<"; { printf '\n%s\n' "$begin"; printf '%s\n' "$content"; printf '%s\n' "$end"; } | append_file "$file"; chown_target "$file"; }
 
 # ---------- Zsh / GitHub ----------
-is_http_url() { [[ "${1:-}" =~ ^https?:// ]]; }
-validate_url_value() { local url="${1:-}"; is_http_url "$url" || fatal "URL 必须以 http:// 或 https:// 开头：$url"; ! has_unsafe_url_chars "$url" || fatal "URL 含有空白、引号或 shell 特殊字符，已拒绝：$url"; }
-ask_github_proxy() { local input proxy; proxy="${GITHUB_PROXY_PREFIX:-}"; if [[ -t 0 ]]; then echo "GitHub 访问慢时，可输入你信任的企业/自建 GitHub 加速前缀；留空表示直连。" >&2; read -r -p "GitHub 加速前缀 [${proxy:-直连}]: " input || true; input="$(trim_string "${input:-}")"; [[ -n "$input" ]] && proxy="$input"; fi; proxy="$(trim_string "$proxy")"; [[ -n "$proxy" ]] || { printf ''; return 0; }; is_http_url "$proxy" || { warn "GitHub 加速前缀不是 http(s) URL，已改为直连。" >&2; printf ''; return 0; }; printf '%s' "${proxy%/}/"; }
-github_url() { local repo_url="$1" proxy="${2:-}"; [[ -n "$proxy" ]] || { printf '%s' "$repo_url"; return 0; }; printf '%s%s' "$proxy" "$repo_url"; }
-clone_or_update_repo() { local repo_url="$1" dest="$2" proxy="${3:-}" final_url; final_url="$(github_url "$repo_url" "$proxy")"; if [[ -d "$dest/.git" ]]; then info "仓库已存在，尝试更新：$dest"; run_as_target_user git -C "$dest" pull --ff-only; else run_as_target_user git clone --depth=1 "$final_url" "$dest"; fi; }
-install_oh_my_zsh() { ensure_target_home; has_cmd git || pkg_install git; has_cmd zsh || pkg_install zsh; local home zsh_dir zshrc proxy; proxy="${1:-}"; [[ -n "$proxy" ]] || proxy="$(ask_github_proxy)"; home="$(target_user_home)"; zsh_dir="$home/.oh-my-zsh"; zshrc="$home/.zshrc"; clone_or_update_repo "https://github.com/ohmyzsh/ohmyzsh.git" "$zsh_dir" "$proxy"; [[ -f "$zsh_dir/oh-my-zsh.sh" ]] || fatal "Oh My Zsh 安装校验失败"; [[ -f "$zshrc" ]] || write_file "$zshrc" <<'EOF_ZSHRC'
+tools_is_http_url() { [[ "${1:-}" =~ ^https?:// ]]; }
+tools_validate_url() { local url="${1:-}"; tools_is_http_url "$url" || fatal "URL 必须以 http:// 或 https:// 开头：$url"; ! has_unsafe_url_chars "$url" || fatal "URL 含有空白、引号或 shell 特殊字符，已拒绝：$url"; }
+tools_ask_github_proxy() { local input proxy; proxy="${GITHUB_PROXY_PREFIX:-}"; if [[ -t 0 ]]; then echo "GitHub 访问慢时，可输入你信任的企业/自建 GitHub 加速前缀；留空表示直连。" >&2; read -r -p "GitHub 加速前缀 [${proxy:-直连}]: " input || true; input="$(trim_string "${input:-}")"; [[ -n "$input" ]] && proxy="$input"; fi; proxy="$(trim_string "$proxy")"; [[ -n "$proxy" ]] || { printf ''; return 0; }; tools_is_http_url "$proxy" || { warn "GitHub 加速前缀不是 http(s) URL，已改为直连。" >&2; printf ''; return 0; }; printf '%s' "${proxy%/}/"; }
+tools_github_url() { local repo_url="$1" proxy="${2:-}"; [[ -n "$proxy" ]] || { printf '%s' "$repo_url"; return 0; }; printf '%s%s' "$proxy" "$repo_url"; }
+tools_clone_or_update_repo() { local repo_url="$1" dest="$2" proxy="${3:-}" final_url; final_url="$(tools_github_url "$repo_url" "$proxy")"; if [[ -d "$dest/.git" ]]; then info "仓库已存在，尝试更新：$dest"; run_as_target_user git -C "$dest" pull --ff-only; else run_as_target_user git clone --depth=1 "$final_url" "$dest"; fi; }
+tools_install_oh_my_zsh() { ensure_target_home; has_cmd git || pkg_install git; has_cmd zsh || pkg_install zsh; local home zsh_dir zshrc proxy; proxy="${1:-}"; [[ -n "$proxy" ]] || proxy="$(tools_ask_github_proxy)"; home="$(target_user_home)"; zsh_dir="$home/.oh-my-zsh"; zshrc="$home/.zshrc"; tools_clone_or_update_repo "https://github.com/ohmyzsh/ohmyzsh.git" "$zsh_dir" "$proxy"; [[ -f "$zsh_dir/oh-my-zsh.sh" ]] || fatal "Oh My Zsh 安装校验失败"; [[ -f "$zshrc" ]] || write_file "$zshrc" <<'EOF_ZSHRC'
 export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="robbyrussell"
 plugins=(git)
 source "$ZSH/oh-my-zsh.sh"
 EOF_ZSHRC
 chown_target "$zshrc"; success "Oh My Zsh 安装完成。"; }
-install_zsh_plugins() { ensure_target_home; has_cmd git || pkg_install git; local home custom proxy p1 p2 zshrc; proxy="${1:-}"; [[ -n "$proxy" ]] || proxy="$(ask_github_proxy)"; home="$(target_user_home)"; custom="$home/.oh-my-zsh/custom"; zshrc="$home/.zshrc"; [[ -d "$home/.oh-my-zsh" ]] || install_oh_my_zsh "$proxy"; run mkdir -p "$custom/plugins"; p1="$custom/plugins/zsh-autosuggestions"; p2="$custom/plugins/zsh-syntax-highlighting"; clone_or_update_repo "https://github.com/zsh-users/zsh-autosuggestions.git" "$p1" "$proxy"; clone_or_update_repo "https://github.com/zsh-users/zsh-syntax-highlighting.git" "$p2" "$proxy"; [[ -f "$zshrc" ]] && grep -q '^plugins=' "$zshrc" 2>/dev/null && run sed -i.bak 's/^plugins=.*/plugins=(git zsh-autosuggestions zsh-syntax-highlighting)/' "$zshrc"; chown_target "$p1" "$p2" "$zshrc"; success "Oh My Zsh 插件安装并配置完成。"; }
-install_rupa_z() { ensure_target_home; has_cmd git || pkg_install git; local home dest zshrc bashrc proxy block; proxy="${1:-}"; [[ -n "$proxy" ]] || proxy="$(ask_github_proxy)"; home="$(target_user_home)"; dest="$home/.local/share/z"; zshrc="$home/.zshrc"; bashrc="$home/.bashrc"; run mkdir -p "$home/.local/share"; clone_or_update_repo "https://github.com/rupa/z.git" "$dest" "$proxy"; block='if [ -f "$HOME/.local/share/z/z.sh" ]; then
+tools_install_zsh_plugins() { ensure_target_home; has_cmd git || pkg_install git; local home custom proxy p1 p2 zshrc; proxy="${1:-}"; [[ -n "$proxy" ]] || proxy="$(tools_ask_github_proxy)"; home="$(target_user_home)"; custom="$home/.oh-my-zsh/custom"; zshrc="$home/.zshrc"; [[ -d "$home/.oh-my-zsh" ]] || tools_install_oh_my_zsh "$proxy"; run mkdir -p "$custom/plugins"; p1="$custom/plugins/zsh-autosuggestions"; p2="$custom/plugins/zsh-syntax-highlighting"; tools_clone_or_update_repo "https://github.com/zsh-users/zsh-autosuggestions.git" "$p1" "$proxy"; tools_clone_or_update_repo "https://github.com/zsh-users/zsh-syntax-highlighting.git" "$p2" "$proxy"; [[ -f "$zshrc" ]] && grep -q '^plugins=' "$zshrc" 2>/dev/null && run sed -i.bak 's/^plugins=.*/plugins=(git zsh-autosuggestions zsh-syntax-highlighting)/' "$zshrc"; chown_target "$p1" "$p2" "$zshrc"; success "Oh My Zsh 插件安装并配置完成。"; }
+tools_install_rupa_z() { ensure_target_home; has_cmd git || pkg_install git; local home dest zshrc bashrc proxy block; proxy="${1:-}"; [[ -n "$proxy" ]] || proxy="$(tools_ask_github_proxy)"; home="$(target_user_home)"; dest="$home/.local/share/z"; zshrc="$home/.zshrc"; bashrc="$home/.bashrc"; run mkdir -p "$home/.local/share"; tools_clone_or_update_repo "https://github.com/rupa/z.git" "$dest" "$proxy"; block='if [ -f "$HOME/.local/share/z/z.sh" ]; then
   . "$HOME/.local/share/z/z.sh"
-fi'; write_managed_block "$zshrc" "rupa-z" "$block"; write_managed_block "$bashrc" "rupa-z" "$block"; success "rupa/z 安装完成。"; }
-configure_zsh_full() { local proxy; proxy="$(ask_github_proxy)"; install_oh_my_zsh "$proxy"; install_zsh_plugins "$proxy"; install_rupa_z "$proxy"; configure_zsh_basic; success "完整 Zsh 环境初始化完成。"; }
-change_default_shell_to_zsh() { has_cmd zsh || pkg_install zsh; local user zsh_path; user="$(target_user_name)"; zsh_path="$(cmd_path zsh | head -n1)"; [[ -n "$zsh_path" ]] || fatal "未找到 zsh。"; grep -qx "$zsh_path" /etc/shells 2>/dev/null || echo "$zsh_path" | run_privileged tee -a /etc/shells >/dev/null; is_macos && run_privileged chsh -s "$zsh_path" "$user" || run chsh -s "$zsh_path" "$user"; success "已将用户 ${user} 的默认 Shell 设置为 ${zsh_path}。"; }
-configure_common_tools() { configure_vim; configure_tmux; configure_git; configure_zsh_basic; success "常用工具基础配置完成。"; }
+fi'; tools_write_managed_block "$zshrc" "rupa-z" "$block"; tools_write_managed_block "$bashrc" "rupa-z" "$block"; success "rupa/z 安装完成。"; }
+tools_config_zsh_full() { local proxy; proxy="$(tools_ask_github_proxy)"; tools_install_oh_my_zsh "$proxy"; tools_install_zsh_plugins "$proxy"; tools_install_rupa_z "$proxy"; tools_config_zsh_basic; success "完整 Zsh 环境初始化完成。"; }
+tools_change_shell_to_zsh() { has_cmd zsh || pkg_install zsh; local user zsh_path; user="$(target_user_name)"; zsh_path="$(cmd_path zsh | head -n1)"; [[ -n "$zsh_path" ]] || fatal "未找到 zsh。"; grep -qx "$zsh_path" /etc/shells 2>/dev/null || echo "$zsh_path" | run_privileged tee -a /etc/shells >/dev/null; is_macos && run_privileged chsh -s "$zsh_path" "$user" || run chsh -s "$zsh_path" "$user"; success "已将用户 ${user} 的默认 Shell 设置为 ${zsh_path}。"; }
+tools_config_all() { tools_config_vim; tools_config_tmux; tools_config_git; tools_config_zsh_basic; success "常用工具基础配置完成。"; }
 
 # ---------- 镜像源 ----------
-source_base_url() { local source="${1:-$DEFAULT_SOURCE}" url; case "$source" in official) printf '' ;; tuna) printf 'https://mirrors.tuna.tsinghua.edu.cn' ;; ustc) printf 'https://mirrors.ustc.edu.cn' ;; aliyun) printf 'https://mirrors.aliyun.com' ;; tencent) printf 'https://mirrors.cloud.tencent.com' ;; bfsu) printf 'https://mirrors.bfsu.edu.cn' ;; custom:*) url="${source#custom:}"; url="$(trim_string "$url")"; validate_url_value "$url"; printf '%s' "${url%/}" ;; http://*|https://*) validate_url_value "$source"; printf '%s' "${source%/}" ;; *) fatal "未知镜像源：$source" ;; esac; }
-backup_root() { is_macos && printf '%s/.local/state/linux-admin-toolkit/backups' "$(target_user_home)" || printf '%s' "$BACKUP_ROOT"; }
-backup_sources() { local ts dir root home; ts="$(date +%Y%m%d-%H%M%S)"; root="$(backup_root)"; dir="$root/$ts"; if is_macos; then run mkdir -p "$dir"; home="$(target_user_home)"; run mkdir -p "$dir/home"; run_shell "cp -a '$home/.zprofile' '$home/.zshrc' '$home/.bashrc' '$dir/home/' 2>/dev/null || true"; success "macOS/Homebrew 配置已备份到：$dir"; return 0; fi; run_privileged mkdir -p "$dir"; [[ -d /etc/apt ]] && { run mkdir -p "$dir/etc/apt"; run_shell "cp -a /etc/apt/sources.list /etc/apt/sources.list.d '$dir/etc/apt/' 2>/dev/null || true"; }; [[ -d /etc/yum.repos.d ]] && { run mkdir -p "$dir/etc/yum.repos.d"; run_shell "cp -a /etc/yum.repos.d/*.repo '$dir/etc/yum.repos.d/' 2>/dev/null || true"; }; [[ -f /etc/pacman.conf || -d /etc/pacman.d ]] && { run mkdir -p "$dir/etc/pacman.d"; run_shell "cp -a /etc/pacman.conf '$dir/etc/' 2>/dev/null || true"; run_shell "cp -a /etc/pacman.d/mirrorlist '$dir/etc/pacman.d/' 2>/dev/null || true"; }; success "镜像源已备份到：$dir"; }
-list_source_backups() { local root; root="$(backup_root)"; mkdir -p "$root" 2>/dev/null || run_privileged mkdir -p "$root"; find "$root" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sed "s#^$root/##" | sort || true; }
-restore_sources() { local name="${1:-}" dir home; [[ -z "$name" ]] && { echo "可用备份："; list_source_backups; read -r -p "输入要恢复的备份目录名：" name; }; [[ -n "$name" && "$name" != */* && "$name" != *..* ]] || fatal "备份目录名不合法：$name"; dir="$(backup_root)/$name"; [[ -d "$dir" ]] || fatal "备份不存在：$dir"; confirm "确认恢复 ${dir} 到源/配置？" || cancelled; if is_macos; then home="$(target_user_home)"; run_shell "cp -a '$dir/home/'* '$home/' 2>/dev/null || true"; chown_target "$home/.zprofile" "$home/.zshrc" "$home/.bashrc" 2>/dev/null || true; success "macOS/Homebrew 配置恢复完成。"; return 0; fi; [[ -d "$dir/etc/apt" ]] && run_shell "cp -a '$dir/etc/apt/'* /etc/apt/ 2>/dev/null || true"; [[ -d "$dir/etc/yum.repos.d" ]] && run_shell "cp -a '$dir/etc/yum.repos.d/'*.repo /etc/yum.repos.d/ 2>/dev/null || true"; [[ -f "$dir/etc/pacman.conf" ]] && run_shell "cp -a '$dir/etc/pacman.conf' /etc/pacman.conf"; [[ -f "$dir/etc/pacman.d/mirrorlist" ]] && run_shell "cp -a '$dir/etc/pacman.d/mirrorlist' /etc/pacman.d/mirrorlist"; refresh_pkg_cache; success "恢复完成。"; }
-set_homebrew_mirror() { local source="${1:-official}" home zprofile zshrc bashrc block base; ensure_target_home; home="$(target_user_home)"; zprofile="$home/.zprofile"; zshrc="$home/.zshrc"; bashrc="$home/.bashrc"; backup_sources; [[ "$source" == official ]] && { remove_managed_block "$zprofile" homebrew-mirror; remove_managed_block "$zshrc" homebrew-mirror; remove_managed_block "$bashrc" homebrew-mirror; success "已移除脚本管理的 Homebrew 镜像环境变量。"; return 0; }; base="$(source_base_url "$source")"; block="export HOMEBREW_API_DOMAIN=\"${base%/}/homebrew-bottles/api\"\nexport HOMEBREW_BOTTLE_DOMAIN=\"${base%/}/homebrew-bottles\""; write_managed_block "$zprofile" homebrew-mirror "$block"; write_managed_block "$zshrc" homebrew-mirror "$block"; write_managed_block "$bashrc" homebrew-mirror "$block"; success "Homebrew 镜像变量已写入 shell 配置。"; }
-set_apt_mirror() { local source="${1:-$DEFAULT_SOURCE}" base codename components target_file main_uri security_uri; codename="$(get_codename)"; [[ -n "$codename" ]] || fatal "无法识别 codename。"; backup_sources; components="main contrib non-free non-free-firmware"; if [[ "$source" == official ]]; then main_uri="http://deb.debian.org/debian"; security_uri="http://deb.debian.org/debian-security"; elif [[ "$OS_ID" == ubuntu || "$OS_LIKE" == *ubuntu* ]]; then base="$(source_base_url "$source")"; main_uri="${base}/ubuntu"; security_uri="$main_uri"; components="main restricted universe multiverse"; else base="$(source_base_url "$source")"; main_uri="${base}/debian"; security_uri="${base}/debian-security"; fi; target_file="/etc/apt/sources.list"; write_file "$target_file" <<EOF_APT
+mirror_base_url() { local source="${1:-$DEFAULT_SOURCE}" url; case "$source" in official) printf '' ;; tuna) printf 'https://mirrors.tuna.tsinghua.edu.cn' ;; ustc) printf 'https://mirrors.ustc.edu.cn' ;; aliyun) printf 'https://mirrors.aliyun.com' ;; tencent) printf 'https://mirrors.cloud.tencent.com' ;; bfsu) printf 'https://mirrors.bfsu.edu.cn' ;; custom:*) url="${source#custom:}"; url="$(trim_string "$url")"; tools_validate_url "$url"; printf '%s' "${url%/}" ;; http://*|https://*) tools_validate_url "$source"; printf '%s' "${source%/}" ;; *) fatal "未知镜像源：$source" ;; esac; }
+mirror_backup_root() { is_macos && printf '%s/.local/state/linux-admin-toolkit/backups' "$(target_user_home)" || printf '%s' "$BACKUP_ROOT"; }
+mirror_backup() { local ts dir root home; ts="$(date +%Y%m%d-%H%M%S)"; root="$(mirror_backup_root)"; dir="$root/$ts"; if is_macos; then run mkdir -p "$dir"; home="$(target_user_home)"; run mkdir -p "$dir/home"; run_shell "cp -a '$home/.zprofile' '$home/.zshrc' '$home/.bashrc' '$dir/home/' 2>/dev/null || true"; success "macOS/Homebrew 配置已备份到：$dir"; return 0; fi; run_privileged mkdir -p "$dir"; [[ -d /etc/apt ]] && { run mkdir -p "$dir/etc/apt"; run_shell "cp -a /etc/apt/sources.list /etc/apt/sources.list.d '$dir/etc/apt/' 2>/dev/null || true"; }; [[ -d /etc/yum.repos.d ]] && { run mkdir -p "$dir/etc/yum.repos.d"; run_shell "cp -a /etc/yum.repos.d/*.repo '$dir/etc/yum.repos.d/' 2>/dev/null || true"; }; [[ -f /etc/pacman.conf || -d /etc/pacman.d ]] && { run mkdir -p "$dir/etc/pacman.d"; run_shell "cp -a /etc/pacman.conf '$dir/etc/' 2>/dev/null || true"; run_shell "cp -a /etc/pacman.d/mirrorlist '$dir/etc/pacman.d/' 2>/dev/null || true"; }; success "镜像源已备份到：$dir"; }
+mirror_list_backups() { local root; root="$(mirror_backup_root)"; mkdir -p "$root" 2>/dev/null || run_privileged mkdir -p "$root"; find "$root" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sed "s#^$root/##" | sort || true; }
+mirror_restore() { local name="${1:-}" dir home; [[ -z "$name" ]] && { echo "可用备份："; mirror_list_backups; read -r -p "输入要恢复的备份目录名：" name; }; [[ -n "$name" && "$name" != */* && "$name" != *..* ]] || fatal "备份目录名不合法：$name"; dir="$(mirror_backup_root)/$name"; [[ -d "$dir" ]] || fatal "备份不存在：$dir"; confirm "确认恢复 ${dir} 到源/配置？" || cancelled; if is_macos; then home="$(target_user_home)"; run_shell "cp -a '$dir/home/'* '$home/' 2>/dev/null || true"; chown_target "$home/.zprofile" "$home/.zshrc" "$home/.bashrc" 2>/dev/null || true; success "macOS/Homebrew 配置恢复完成。"; return 0; fi; [[ -d "$dir/etc/apt" ]] && run_shell "cp -a '$dir/etc/apt/'* /etc/apt/ 2>/dev/null || true"; [[ -d "$dir/etc/yum.repos.d" ]] && run_shell "cp -a '$dir/etc/yum.repos.d/'*.repo /etc/yum.repos.d/ 2>/dev/null || true"; [[ -f "$dir/etc/pacman.conf" ]] && run_shell "cp -a '$dir/etc/pacman.conf' /etc/pacman.conf"; [[ -f "$dir/etc/pacman.d/mirrorlist" ]] && run_shell "cp -a '$dir/etc/pacman.d/mirrorlist' /etc/pacman.d/mirrorlist"; refresh_pkg_cache; success "恢复完成。"; }
+mirror_set_homebrew() { local source="${1:-official}" home zprofile zshrc bashrc block base; ensure_target_home; home="$(target_user_home)"; zprofile="$home/.zprofile"; zshrc="$home/.zshrc"; bashrc="$home/.bashrc"; mirror_backup; [[ "$source" == official ]] && { tools_remove_managed_block "$zprofile" homebrew-mirror; tools_remove_managed_block "$zshrc" homebrew-mirror; tools_remove_managed_block "$bashrc" homebrew-mirror; success "已移除脚本管理的 Homebrew 镜像环境变量。"; return 0; }; base="$(mirror_base_url "$source")"; block="export HOMEBREW_API_DOMAIN=\"${base%/}/homebrew-bottles/api\"\nexport HOMEBREW_BOTTLE_DOMAIN=\"${base%/}/homebrew-bottles\""; tools_write_managed_block "$zprofile" homebrew-mirror "$block"; tools_write_managed_block "$zshrc" homebrew-mirror "$block"; tools_write_managed_block "$bashrc" homebrew-mirror "$block"; success "Homebrew 镜像变量已写入 shell 配置。"; }
+mirror_set_apt() { local source="${1:-$DEFAULT_SOURCE}" base codename components target_file main_uri security_uri; codename="$(get_codename)"; [[ -n "$codename" ]] || fatal "无法识别 codename。"; mirror_backup; components="main contrib non-free non-free-firmware"; if [[ "$source" == official ]]; then main_uri="http://deb.debian.org/debian"; security_uri="http://deb.debian.org/debian-security"; elif [[ "$OS_ID" == ubuntu || "$OS_LIKE" == *ubuntu* ]]; then base="$(mirror_base_url "$source")"; main_uri="${base}/ubuntu"; security_uri="$main_uri"; components="main restricted universe multiverse"; else base="$(mirror_base_url "$source")"; main_uri="${base}/debian"; security_uri="${base}/debian-security"; fi; target_file="/etc/apt/sources.list"; write_file "$target_file" <<EOF_APT
 deb ${main_uri} ${codename} ${components}
 deb ${main_uri} ${codename}-updates ${components}
 deb ${main_uri} ${codename}-backports ${components}
 deb ${security_uri} ${codename}-security ${components}
 EOF_APT
 success "已写入 apt 源：${target_file}"; refresh_pkg_cache; }
-set_rpm_mirror() { local source="${1:-$DEFAULT_SOURCE}" base; [[ "$source" == official ]] && skipped "RPM 系发行版官方源格式差异较大，脚本不强制重写为官方源。"; base="$(source_base_url "$source")"; backup_sources; is_kylin && skipped "检测到麒麟系统，脚本只做备份，不自动替换。"; if is_fedora; then run_shell "sed -i.linux-admin.bak -e 's|^metalink=|#metalink=|g' -e 's|^#baseurl=http://download.example/pub/fedora/linux|baseurl=${base}/fedora|g' -e 's|^#baseurl=https://download.example/pub/fedora/linux|baseurl=${base}/fedora|g' /etc/yum.repos.d/fedora*.repo"; else run_shell "sed -i.linux-admin.bak -e 's|^mirrorlist=|#mirrorlist=|g' -e 's|^#baseurl=http://mirror.centos.org/centos|baseurl=${base}/centos|g' -e 's|^#baseurl=https://mirror.centos.org/centos|baseurl=${base}/centos|g' /etc/yum.repos.d/*.repo"; fi; refresh_pkg_cache; success "RPM 镜像源处理完成。"; }
-set_pacman_mirror() { local source="${1:-$DEFAULT_SOURCE}" base mirror_url; backup_sources; if [[ "$source" == official ]]; then mirror_url='https://geo.mirror.pkgbuild.com/$repo/os/$arch'; else base="$(source_base_url "$source")"; mirror_url="${base}/archlinux/\$repo/os/\$arch"; fi; write_file /etc/pacman.d/mirrorlist <<EOF_PACMAN
+mirror_set_rpm() { local source="${1:-$DEFAULT_SOURCE}" base; [[ "$source" == official ]] && skipped "RPM 系发行版官方源格式差异较大，脚本不强制重写为官方源。"; base="$(mirror_base_url "$source")"; mirror_backup; is_kylin && skipped "检测到麒麟系统，脚本只做备份，不自动替换。"; if is_fedora; then run_shell "sed -i.linux-admin.bak -e 's|^metalink=|#metalink=|g' -e 's|^#baseurl=http://download.example/pub/fedora/linux|baseurl=${base}/fedora|g' -e 's|^#baseurl=https://download.example/pub/fedora/linux|baseurl=${base}/fedora|g' /etc/yum.repos.d/fedora*.repo"; else run_shell "sed -i.linux-admin.bak -e 's|^mirrorlist=|#mirrorlist=|g' -e 's|^#baseurl=http://mirror.centos.org/centos|baseurl=${base}/centos|g' -e 's|^#baseurl=https://mirror.centos.org/centos|baseurl=${base}/centos|g' /etc/yum.repos.d/*.repo"; fi; refresh_pkg_cache; success "RPM 镜像源处理完成。"; }
+mirror_set_pacman() { local source="${1:-$DEFAULT_SOURCE}" base mirror_url; mirror_backup; if [[ "$source" == official ]]; then mirror_url='https://geo.mirror.pkgbuild.com/$repo/os/$arch'; else base="$(mirror_base_url "$source")"; mirror_url="${base}/archlinux/\$repo/os/\$arch"; fi; write_file /etc/pacman.d/mirrorlist <<EOF_PACMAN
 Server = ${mirror_url}
 EOF_PACMAN
 refresh_pkg_cache; success "Arch Linux pacman 镜像源已写入：/etc/pacman.d/mirrorlist"; }
-set_system_mirror() { local source="${1:-$DEFAULT_SOURCE}"; if is_macos; then set_homebrew_mirror "$source"; return 0; fi; case "$PKG_MANAGER" in apt) set_apt_mirror "$source" ;; dnf|yum) set_rpm_mirror "$source" ;; pacman) set_pacman_mirror "$source" ;; *) fatal "未检测到支持的包管理器。" ;; esac; }
-choose_mirror_source() { local c custom; CHOSEN_MIRROR_SOURCE=""; cat <<'EOF_SOURCE'
+mirror_set() { local source="${1:-$DEFAULT_SOURCE}"; if is_macos; then mirror_set_homebrew "$source"; return 0; fi; case "$PKG_MANAGER" in apt) mirror_set_apt "$source" ;; dnf|yum) mirror_set_rpm "$source" ;; pacman) mirror_set_pacman "$source" ;; *) fatal "未检测到支持的包管理器。" ;; esac; }
+mirror_choose_source() { local c custom; CHOSEN_MIRROR_SOURCE=""; cat <<'EOF_SOURCE'
 
 选择源：
 1) 官方源 official（默认）
@@ -292,33 +292,33 @@ choose_mirror_source() { local c custom; CHOSEN_MIRROR_SOURCE=""; cat <<'EOF_SOU
 7) 自定义基础 URL
 EOF_SOURCE
 read -r -p "请输入选项或源名称 [1]: " c; c="$(trim_string "${c:-1}")"; case "$c" in 1|official|官方|官方源) CHOSEN_MIRROR_SOURCE=official ;; 2|tuna|TUNA|清华|清华源) CHOSEN_MIRROR_SOURCE=tuna ;; 3|ustc|USTC|中科大|中科大源) CHOSEN_MIRROR_SOURCE=ustc ;; 4|aliyun|ALIYUN|阿里|阿里云) CHOSEN_MIRROR_SOURCE=aliyun ;; 5|tencent|TENCENT|腾讯|腾讯云) CHOSEN_MIRROR_SOURCE=tencent ;; 6|bfsu|BFSU|北外) CHOSEN_MIRROR_SOURCE=bfsu ;; 7) read -r -p "输入基础 URL，如 https://mirrors.example.com: " custom; custom="$(trim_string "$custom")"; [[ -n "$custom" ]] && CHOSEN_MIRROR_SOURCE="custom:${custom%/}" || CHOSEN_MIRROR_SOURCE=official ;; http://*|https://*|custom:http://*|custom:https://*) CHOSEN_MIRROR_SOURCE="${c%/}" ;; *) warn "无效选择：${c}，使用官方源。"; CHOSEN_MIRROR_SOURCE=official ;; esac; }
-menu_set_system_mirror() { local s; choose_mirror_source; s="$CHOSEN_MIRROR_SOURCE"; [[ -n "$s" ]] || cancelled; info "已选择源：${s}"; set_system_mirror "$s"; }
+menu_mirror_set() { local s; mirror_choose_source; s="$CHOSEN_MIRROR_SOURCE"; [[ -n "$s" ]] || cancelled; info "已选择源：${s}"; mirror_set "$s"; }
 
 # ---------- Docker ----------
-registry_mirrors_json() { local input="$1" old_ifs item out="[" sep=""; old_ifs="$IFS"; IFS=','; for item in $input; do item="$(trim_string "$item")"; [[ -n "$item" ]] || continue; validate_url_value "$item"; out="${out}${sep}\"${item}\""; sep=", "; done; IFS="$old_ifs"; [[ "$out" != "[" ]] || fatal "未输入有效的 registry mirror URL。"; printf '%s]' "$out"; }
-docker_repo_base() { local s="${1:-$DEFAULT_DOCKER_SOURCE}"; case "$s" in official) printf 'https://download.docker.com' ;; tuna) printf 'https://mirrors.tuna.tsinghua.edu.cn/docker-ce' ;; ustc) printf 'https://mirrors.ustc.edu.cn/docker-ce' ;; aliyun) printf 'https://mirrors.aliyun.com/docker-ce' ;; tencent) printf 'https://mirrors.cloud.tencent.com/docker-ce' ;; bfsu) printf 'https://mirrors.bfsu.edu.cn/docker-ce' ;; custom:*|http://*|https://*) source_base_url "$s" ;; *) fatal "未知 Docker 源：$s" ;; esac; }
+docker_registry_mirrors_json() { local input="$1" old_ifs item out="[" sep=""; old_ifs="$IFS"; IFS=','; for item in $input; do item="$(trim_string "$item")"; [[ -n "$item" ]] || continue; tools_validate_url "$item"; out="${out}${sep}\"${item}\""; sep=", "; done; IFS="$old_ifs"; [[ "$out" != "[" ]] || fatal "未输入有效的 registry mirror URL。"; printf '%s]' "$out"; }
+docker_repo_base() { local s="${1:-$DEFAULT_DOCKER_SOURCE}"; case "$s" in official) printf 'https://download.docker.com' ;; tuna) printf 'https://mirrors.tuna.tsinghua.edu.cn/docker-ce' ;; ustc) printf 'https://mirrors.ustc.edu.cn/docker-ce' ;; aliyun) printf 'https://mirrors.aliyun.com/docker-ce' ;; tencent) printf 'https://mirrors.cloud.tencent.com/docker-ce' ;; bfsu) printf 'https://mirrors.bfsu.edu.cn/docker-ce' ;; custom:*|http://*|https://*) mirror_base_url "$s" ;; *) fatal "未知 Docker 源：$s" ;; esac; }
 docker_repo_os() { if [[ "$OS_ID" == ubuntu || "$OS_LIKE" == *ubuntu* ]]; then printf ubuntu; elif [[ "$OS_ID" == debian || "$OS_LIKE" == *debian* ]]; then printf debian; elif is_fedora; then printf fedora; else printf centos; fi; }
-remove_old_docker_conflicts() { [[ "$PKG_MANAGER" == pacman ]] && return 0; [[ "$PKG_MANAGER" == apt ]] && pkg_remove docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc || pkg_remove docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine podman-docker || true; }
-install_docker_macos() { ensure_brew; brew_run install --cask docker-desktop; success "Docker Desktop 已安装。首次使用请从 Applications 启动 Docker。"; }
-install_docker_pacman() { pkg_install docker docker-compose; }
-install_docker_apt() { local source="${1:-$DEFAULT_DOCKER_SOURCE}" base repo_os codename arch list_file; base="$(docker_repo_base "$source")"; repo_os="$(docker_repo_os)"; codename="$(get_codename)"; arch="$(dpkg --print-architecture 2>/dev/null || true)"; [[ -n "$codename" ]] || fatal "无法识别 codename。"; remove_old_docker_conflicts; pkg_install ca-certificates curl gnupg; run install -m 0755 -d /etc/apt/keyrings; run_shell "curl -fsSL '${base}/linux/${repo_os}/gpg' | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg"; run chmod a+r /etc/apt/keyrings/docker.gpg; list_file=/etc/apt/sources.list.d/docker.list; write_file "$list_file" <<EOF_DOCKER
+docker_remove_old_conflicts() { [[ "$PKG_MANAGER" == pacman ]] && return 0; [[ "$PKG_MANAGER" == apt ]] && pkg_remove docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc || pkg_remove docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine podman-docker || true; }
+docker_install_macos() { ensure_brew; brew_run install --cask docker-desktop; success "Docker Desktop 已安装。首次使用请从 Applications 启动 Docker。"; }
+docker_install_pacman() { pkg_install docker docker-compose; }
+docker_install_apt() { local source="${1:-$DEFAULT_DOCKER_SOURCE}" base repo_os codename arch list_file; base="$(docker_repo_base "$source")"; repo_os="$(docker_repo_os)"; codename="$(get_codename)"; arch="$(dpkg --print-architecture 2>/dev/null || true)"; [[ -n "$codename" ]] || fatal "无法识别 codename。"; docker_remove_old_conflicts; pkg_install ca-certificates curl gnupg; run install -m 0755 -d /etc/apt/keyrings; run_shell "curl -fsSL '${base}/linux/${repo_os}/gpg' | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg"; run chmod a+r /etc/apt/keyrings/docker.gpg; list_file=/etc/apt/sources.list.d/docker.list; write_file "$list_file" <<EOF_DOCKER
 deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.gpg] ${base}/linux/${repo_os} ${codename} stable
 EOF_DOCKER
 refresh_pkg_cache; pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; }
-install_docker_rpm() { local source="${1:-$DEFAULT_DOCKER_SOURCE}" base repo_os repo_url; base="$(docker_repo_base "$source")"; repo_os="$(docker_repo_os)"; remove_old_docker_conflicts; pkg_install yum-utils; repo_url="${base}/linux/${repo_os}/docker-ce.repo"; has_cmd dnf && run dnf config-manager --add-repo "$repo_url" || run yum-config-manager --add-repo "$repo_url"; [[ "$source" != official ]] && run_shell "sed -i.bak 's#https://download.docker.com#${base}#g' /etc/yum.repos.d/docker-ce.repo"; pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; }
-install_docker() { local source="${1:-$DEFAULT_DOCKER_SOURCE}"; if is_macos; then confirm "即将安装 Docker Desktop。是否继续？" || cancelled; install_docker_macos; return 0; fi; confirm "即将安装 Docker，并可能移除系统中冲突的旧 Docker/Podman 兼容包。是否继续？" || cancelled; case "$PKG_MANAGER" in apt) install_docker_apt "$source" ;; dnf|yum) install_docker_rpm "$source" ;; pacman) install_docker_pacman ;; *) fatal "未检测到支持的包管理器。" ;; esac; has_cmd docker || fatal "Docker 安装后未检测到 docker 命令。"; has_cmd systemctl && run systemctl enable --now docker; success "Docker 安装完成。"; }
-menu_install_docker() { local s; if is_macos || is_arch; then install_docker official; return $?; fi; choose_mirror_source; s="$CHOSEN_MIRROR_SOURCE"; [[ -n "$s" ]] || cancelled; info "已选择 Docker 源：${s}"; install_docker "$s"; }
-configure_docker_registry_mirror() { is_macos && { warn "macOS Docker Desktop 的 registry mirror 建议在 Docker Desktop Settings 中配置。"; return 0; }; local mirrors="${1:-}" daemon_json content; [[ -z "$mirrors" ]] && { echo "输入 Docker Registry mirrors，多个用逗号分隔；留空则清空脚本管理配置。"; read -r -p "Registry mirrors: " mirrors; }; confirm "即将写入 Docker daemon 配置并重启 Docker。是否继续？" || cancelled; daemon_json=/etc/docker/daemon.json; run mkdir -p /etc/docker; if [[ -z "$(trim_string "$mirrors")" ]]; then write_file "$daemon_json" <<'EOF_DAEMON'
+docker_install_rpm() { local source="${1:-$DEFAULT_DOCKER_SOURCE}" base repo_os repo_url; base="$(docker_repo_base "$source")"; repo_os="$(docker_repo_os)"; docker_remove_old_conflicts; pkg_install yum-utils; repo_url="${base}/linux/${repo_os}/docker-ce.repo"; has_cmd dnf && run dnf config-manager --add-repo "$repo_url" || run yum-config-manager --add-repo "$repo_url"; [[ "$source" != official ]] && run_shell "sed -i.bak 's#https://download.docker.com#${base}#g' /etc/yum.repos.d/docker-ce.repo"; pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; }
+docker_install() { local source="${1:-$DEFAULT_DOCKER_SOURCE}"; if is_macos; then confirm "即将安装 Docker Desktop。是否继续？" || cancelled; docker_install_macos; return 0; fi; confirm "即将安装 Docker，并可能移除系统中冲突的旧 Docker/Podman 兼容包。是否继续？" || cancelled; case "$PKG_MANAGER" in apt) docker_install_apt "$source" ;; dnf|yum) docker_install_rpm "$source" ;; pacman) docker_install_pacman ;; *) fatal "未检测到支持的包管理器。" ;; esac; has_cmd docker || fatal "Docker 安装后未检测到 docker 命令。"; has_cmd systemctl && run systemctl enable --now docker; success "Docker 安装完成。"; }
+menu_docker_install() { local s; if is_macos || is_arch; then docker_install official; return $?; fi; mirror_choose_source; s="$CHOSEN_MIRROR_SOURCE"; [[ -n "$s" ]] || cancelled; info "已选择 Docker 源：${s}"; docker_install "$s"; }
+docker_configure_registry_mirror() { is_macos && { warn "macOS Docker Desktop 的 registry mirror 建议在 Docker Desktop Settings 中配置。"; return 0; }; local mirrors="${1:-}" daemon_json content; [[ -z "$mirrors" ]] && { echo "输入 Docker Registry mirrors，多个用逗号分隔；留空则清空脚本管理配置。"; read -r -p "Registry mirrors: " mirrors; }; confirm "即将写入 Docker daemon 配置并重启 Docker。是否继续？" || cancelled; daemon_json=/etc/docker/daemon.json; run mkdir -p /etc/docker; if [[ -z "$(trim_string "$mirrors")" ]]; then write_file "$daemon_json" <<'EOF_DAEMON'
 {}
 EOF_DAEMON
-else content="$(registry_mirrors_json "$mirrors")"; write_file "$daemon_json" <<EOF_DAEMON
+else content="$(docker_registry_mirrors_json "$mirrors")"; write_file "$daemon_json" <<EOF_DAEMON
 {
   "registry-mirrors": ${content}
 }
 EOF_DAEMON
 fi; has_cmd systemctl && { run systemctl daemon-reload; run systemctl restart docker; }; success "Docker Registry mirror 配置完成：${daemon_json}"; }
-save_docker_images_one_by_one() { has_cmd docker || fatal "未检测到 docker 命令。"; docker info >/dev/null 2>&1 || fatal "Docker daemon 不可用。"; local dir="${1:-}" image safe out count=0; [[ -z "$dir" ]] && { read -r -p "输入镜像导出目录 [${HOME:-/root}/docker-images]: " dir; dir="${dir:-${HOME:-/root}/docker-images}"; }; run mkdir -p "$dir"; while IFS= read -r image; do [[ -n "$image" ]] || continue; safe="$(printf '%s' "$image" | tr '/:@' '___')"; out="$dir/${safe}.tar.gz"; info "导出镜像：${image} -> ${out}"; if [[ "$DRY_RUN" -eq 1 ]]; then count=$((count + 1)); continue; fi; docker save "$image" | gzip > "$out"; [[ -s "$out" ]] || fatal "导出失败：$out"; count=$((count + 1)); done < <(docker images --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>' || true); success "Docker 镜像导出完成，数量：${count}。"; }
-uninstall_docker() { local remove_data="${1:-0}"; confirm "即将卸载 Docker 相关软件包。是否继续？" || cancelled; if is_macos; then ensure_brew; brew_run uninstall --cask docker-desktop || true; success "Docker Desktop 卸载完成。"; return 0; fi; has_cmd systemctl && run systemctl stop docker || true; [[ "$PKG_MANAGER" == pacman ]] && pkg_remove docker docker-compose || pkg_remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras || true; [[ "$remove_data" == 1 ]] && confirm "确认删除 /var/lib/docker /var/lib/containerd？" && run rm -rf /var/lib/docker /var/lib/containerd; success "Docker 卸载完成。"; }
+docker_save_images() { has_cmd docker || fatal "未检测到 docker 命令。"; docker info >/dev/null 2>&1 || fatal "Docker daemon 不可用。"; local dir="${1:-}" image safe out count=0; [[ -z "$dir" ]] && { read -r -p "输入镜像导出目录 [${HOME:-/root}/docker-images]: " dir; dir="${dir:-${HOME:-/root}/docker-images}"; }; run mkdir -p "$dir"; while IFS= read -r image; do [[ -n "$image" ]] || continue; safe="$(printf '%s' "$image" | tr '/:@' '___')"; out="$dir/${safe}.tar.gz"; info "导出镜像：${image} -> ${out}"; if [[ "$DRY_RUN" -eq 1 ]]; then count=$((count + 1)); continue; fi; docker save "$image" | gzip > "$out"; [[ -s "$out" ]] || fatal "导出失败：$out"; count=$((count + 1)); done < <(docker images --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>' || true); success "Docker 镜像导出完成，数量：${count}。"; }
+docker_uninstall() { local remove_data="${1:-0}"; confirm "即将卸载 Docker 相关软件包。是否继续？" || cancelled; if is_macos; then ensure_brew; brew_run uninstall --cask docker-desktop || true; success "Docker Desktop 卸载完成。"; return 0; fi; has_cmd systemctl && run systemctl stop docker || true; [[ "$PKG_MANAGER" == pacman ]] && pkg_remove docker docker-compose || pkg_remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras || true; [[ "$remove_data" == 1 ]] && confirm "确认删除 /var/lib/docker /var/lib/containerd？" && run rm -rf /var/lib/docker /var/lib/containerd; success "Docker 卸载完成。"; }
 menu_docker_status() { if is_macos; then [[ -d /Applications/Docker.app || -d "$(target_user_home)/Applications/Docker.app" ]] && success "Docker Desktop App 已安装。" || warn "未检测到 Docker Desktop App。"; has_cmd docker && docker version || warn "当前 PATH 中未检测到 docker CLI。"; return 0; fi; has_cmd systemctl && systemctl status docker --no-pager 2>/dev/null && return 0; has_cmd docker && docker version || warn "未检测到 docker 命令。"; }
 
 # ---------- Docker 离线安装 ----------
@@ -675,7 +675,6 @@ if [[ "${1:-}" == "install" ]]; then
   RESOURCE_DIR="${2:-./resources}"
   [[ -d "$RESOURCE_DIR" ]] || die "资源目录不存在：$RESOURCE_DIR"
   # 安装 Docker
-  local tgz tmpdir f base
   tgz="$(find "$RESOURCE_DIR" -maxdepth 1 -name 'docker-*.tgz' | head -1)"
   [[ -f "$tgz" ]] || die "未找到 Docker 资源包"
   log "安装 Docker Engine：$tgz"
@@ -683,7 +682,7 @@ if [[ "${1:-}" == "install" ]]; then
   for f in "$tmpdir/docker"/*; do [[ -f "$f" ]] && install -m 0755 "$f" "/usr/local/bin/$(basename "$f")"; done
   rm -rf "$tmpdir"
   # 安装 Compose
-  local src="$(find "$RESOURCE_DIR" -maxdepth 1 \( -name 'docker-compose-*' -o -name 'docker-compose-linux-*' \) | head -1)"
+  src="$(find "$RESOURCE_DIR" -maxdepth 1 \( -name 'docker-compose-*' -o -name 'docker-compose-linux-*' \) | head -1)"
   if [[ -f "$src" ]]; then
     log "安装 Docker Compose：$src"
     mkdir -p /usr/local/lib/docker/cli-plugins
@@ -784,7 +783,7 @@ ensure_linux_only() { if is_macos; then not_applicable "$1"; return $?; fi; }
 swap_list() { ensure_linux_only "macOS 的虚拟内存由系统自动管理。"; swapon --show || true; free -h || true; }
 swap_add() { ensure_linux_only "macOS 不支持此 Linux swapfile 操作。"; local size="${1:-}" path="${2:-/swapfile}" input_path; [[ -n "$size" ]] || read -r -p "Swap 大小，如 2G/4096M: " size; [[ -n "$size" ]] || cancelled; [[ "${2:-}" == "" ]] && { read -r -p "Swap 文件路径 [$path]: " input_path || true; path="${input_path:-$path}"; }; [[ ! -e "$path" ]] || fatal "文件已存在：$path"; confirm "即将创建 ${path}，大小 ${size}，并写入 /etc/fstab。是否继续？" || cancelled; has_cmd fallocate && run fallocate -l "$size" "$path" || fatal "缺少 fallocate，请手动创建 swap 文件。"; run chmod 600 "$path"; run mkswap "$path"; run swapon "$path"; append_line_if_missing /etc/fstab "$path none swap sw 0 0"; success "Swap 已增加。"; }
 swap_delete() { ensure_linux_only "macOS 不支持此 Linux swapfile 操作。"; local path="${1:-}"; [[ -n "$path" ]] || { swap_list; read -r -p "输入要删除的 swap 路径，如 /swapfile: " path; }; [[ -n "$path" ]] || cancelled; confirm "即将停用并删除 ${path}。是否继续？" || cancelled; swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$path" && run swapoff "$path" || true; [[ -f /etc/fstab ]] && run sed -i.bak "\#^${path} #d" /etc/fstab; [[ -e "$path" ]] && run rm -f "$path"; success "Swap 已删除。"; }
-swap_resize() { local size="${1:-}" path="${2:-/swapfile}"; [[ -n "$size" ]] || read -r -p "新的 swap 大小，如 4G: " size; [[ -e "$path" ]] && swap_delete "$path"; swap_add "$size" "$path"; }
+swap_resize() { ensure_linux_only "macOS 的虚拟内存由系统自动管理。"; local size="${1:-}" path="${2:-/swapfile}"; [[ -n "$size" ]] || read -r -p "新的 swap 大小，如 4G: " size; [[ -e "$path" ]] && swap_delete "$path"; swap_add "$size" "$path"; }
 # ---------- LVM 管理 (融合自 lvm-manager.sh: 创建/扩容/删除/查询, 自动挂载+fstab, dry-run) ----------
 ensure_lvm() { ensure_linux_only "macOS 不支持 Linux LVM。"; has_cmd lvm || pkg_install lvm2; local missing=(); has_cmd pvcreate || missing+=(lvm2); has_cmd mkfs.xfs || missing+=(xfsprogs); has_cmd mkfs.ext4 || missing+=(e2fsprogs); (( ${#missing[@]} > 0 )) && pkg_install "${missing[@]}"; lvm_check_deps || fatal "LVM 依赖工具仍不完整，请执行: $(lvm_pkg_hint)"; }
 lvm_pkg_hint() {
@@ -1599,7 +1598,7 @@ disk_cleanup_summary() { echo "========== 磁盘使用概况 =========="; df -hT
 
 # ---------- SSL 证书检查 ----------
 ssl_check() { local host="${1:-}" port="${2:-443}"; [[ -n "$host" ]] || read -r -p "域名: " host; [[ -n "$host" ]] || cancelled; info "检查 SSL 证书：${host}:${port}"; echo | openssl s_client -servername "$host" -connect "${host}:${port}" 2>/dev/null | openssl x509 -noout -dates -subject -issuer 2>/dev/null || { has_cmd curl && curl -svI "https://${host}" 2>&1 | grep -E 'expire|subject|issuer|SSL' || true; }; }
-ssl_check_batch() { ensure_linux_only "批量检查依赖 curl。"; local file="${1:-}" host port; [[ -n "$file" ]] || { echo "输入包含域名列表的文件（每行一个域名或 host:port）："; read -r file; }; [[ -f "$file" ]] || fatal "文件不存在：$file"; while IFS= read -r line; do [[ -z "$line" || "$line" == \#* ]] && continue; host="${line%%:*}"; port="${line##*:}"; [[ "$port" == "$host" ]] && port=443; printf '%-40s ' "$host"; echo | openssl s_client -servername "$host" -connect "${host}:${port}" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | sed 's/notAfter=/到期: /' || echo "✗ 连接失败"; done < "$file"; }
+ssl_check_batch() { local file="${1:-}" host port; [[ -n "$file" ]] || { echo "输入包含域名列表的文件（每行一个域名或 host:port）："; read -r file; }; [[ -f "$file" ]] || fatal "文件不存在：$file"; while IFS= read -r line; do [[ -z "$line" || "$line" == \#* ]] && continue; host="${line%%:*}"; port="${line##*:}"; [[ "$port" == "$host" ]] && port=443; printf '%-40s ' "$host"; echo | openssl s_client -servername "$host" -connect "${host}:${port}" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | sed 's/notAfter=/到期: /' || echo "✗ 连接失败"; done < "$file"; }
 
 # ---------- 系统更新 ----------
 system_update_check() { case "$PKG_MANAGER" in apt) run apt-get update; run apt list --upgradable 2>/dev/null | head -30 ;; dnf) run dnf check-update 2>/dev/null | head -30 || true ;; yum) run yum check-update 2>/dev/null | head -30 || true ;; pacman) run pacman -Sy; run pacman -Qu 2>/dev/null | head -30 ;; brew) brew_run update; brew_run outdated ;; *) warn "未检测到支持的包管理器。";; esac; }
@@ -1625,7 +1624,7 @@ menu_tools_config() { local c; while true; do menu_clear; cat <<'EOF_MENU'
 11) 设置默认 Shell 为 zsh
 0) 返回上一级
 EOF_MENU
-read -r -p "选择: " c; case "${c:-}" in 1) menu_action "查看常用工具安装状态" tool_status ;; 2) menu_action "配置 Vim" configure_vim ;; 3) menu_action "配置 Tmux" configure_tmux ;; 4) menu_action "配置 Git" configure_git ;; 5) menu_action "配置基础 Zsh" configure_zsh_basic ;; 6) menu_action "配置常用工具" configure_common_tools ;; 7) menu_action "安装 Oh My Zsh" install_oh_my_zsh ;; 8) menu_action "安装 Oh My Zsh 插件" install_zsh_plugins ;; 9) menu_action "安装 rupa/z" install_rupa_z ;; 10) menu_action "初始化完整 Zsh 环境" configure_zsh_full ;; 11) menu_action "设置默认 Shell 为 zsh" change_default_shell_to_zsh ;; 0) return ;; *) menu_invalid ;; esac; done; }
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "查看常用工具安装状态" tools_status ;; 2) menu_action "配置 Vim" tools_config_vim ;; 3) menu_action "配置 Tmux" tools_config_tmux ;; 4) menu_action "配置 Git" tools_config_git ;; 5) menu_action "配置基础 Zsh" tools_config_zsh_basic ;; 6) menu_action "配置常用工具" tools_config_all ;; 7) menu_action "安装 Oh My Zsh" tools_install_oh_my_zsh ;; 8) menu_action "安装 Oh My Zsh 插件" tools_install_zsh_plugins ;; 9) menu_action "安装 rupa/z" tools_install_rupa_z ;; 10) menu_action "初始化完整 Zsh 环境" tools_config_zsh_full ;; 11) menu_action "设置默认 Shell 为 zsh" tools_change_shell_to_zsh ;; 0) return ;; *) menu_invalid ;; esac; done; }
 menu_common_tools() { local c; while true; do menu_clear; cat <<'EOF_MENU'
 [常用工具]
 1) 安装常用工具
@@ -1634,7 +1633,7 @@ menu_common_tools() { local c; while true; do menu_clear; cat <<'EOF_MENU'
 4) 查看常用工具安装状态
 0) 返回上一级
 EOF_MENU
-read -r -p "选择: " c; case "${c:-}" in 1) menu_action "安装常用工具" install_common_tools ;; 2) menu_tools_config ;; 3) menu_action "安装并初始化完整 Zsh 环境" configure_zsh_full ;; 4) menu_action "查看常用工具安装状态" tool_status ;; 0) return ;; *) menu_invalid ;; esac; done; }
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "安装常用工具" tools_install ;; 2) menu_tools_config ;; 3) menu_action "安装并初始化完整 Zsh 环境" tools_config_zsh_full ;; 4) menu_action "查看常用工具安装状态" tools_status ;; 0) return ;; *) menu_invalid ;; esac; done; }
 menu_mirror() { local c; while true; do menu_clear; cat <<'EOF_MENU'
 [系统镜像源 / Homebrew 镜像]
 1) 查看系统环境
@@ -1645,7 +1644,7 @@ menu_mirror() { local c; while true; do menu_clear; cat <<'EOF_MENU'
 6) 刷新包缓存
 0) 返回上一级
 EOF_MENU
-read -r -p "选择: " c; case "${c:-}" in 1) menu_action "查看系统环境" print_env ;; 2) menu_action "备份当前源" backup_sources ;; 3) menu_action "切换系统源" menu_set_system_mirror ;; 4) menu_action "列出源备份" list_source_backups ;; 5) menu_action "恢复源备份" restore_sources ;; 6) menu_action "刷新包缓存" refresh_pkg_cache ;; 0) return ;; *) menu_invalid ;; esac; done; }
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "查看系统环境" print_env ;; 2) menu_action "备份当前源" mirror_backup ;; 3) menu_action "切换系统源" menu_mirror_set ;; 4) menu_action "列出源备份" mirror_list_backups ;; 5) menu_action "恢复源备份" mirror_restore ;; 6) menu_action "刷新包缓存" refresh_pkg_cache ;; 0) return ;; *) menu_invalid ;; esac; done; }
 menu_docker() { local c; while true; do menu_clear; cat <<'EOF_MENU'
 [Docker]
 1) 安装 Docker CE / Docker Desktop
@@ -1656,7 +1655,7 @@ menu_docker() { local c; while true; do menu_clear; cat <<'EOF_MENU'
 6) 离线安装子菜单（下载/安装/打包/卸载）
 0) 返回上一级
 EOF_MENU
-read -r -p "选择: " c; case "${c:-}" in 1) menu_action "安装 Docker" menu_install_docker ;; 2) menu_action "配置 Docker Registry mirror" configure_docker_registry_mirror ;; 3) menu_action "逐个导出本地镜像为 tar.gz" save_docker_images_one_by_one ;; 4) menu_action "查看 Docker 状态" menu_docker_status ;; 5) menu_action "卸载 Docker" uninstall_docker 0 ;; 6) menu_docker_offline ;; 0) return ;; *) menu_invalid ;; esac; done; }
+read -r -p "选择: " c; case "${c:-}" in 1) menu_action "安装 Docker" menu_docker_install ;; 2) menu_action "配置 Docker Registry mirror" docker_configure_registry_mirror ;; 3) menu_action "逐个导出本地镜像为 tar.gz" docker_save_images ;; 4) menu_action "查看 Docker 状态" menu_docker_status ;; 5) menu_action "卸载 Docker" docker_uninstall 0 ;; 6) menu_docker_offline ;; 0) return ;; *) menu_invalid ;; esac; done; }
 menu_docker_offline() { local c; while true; do menu_clear; cat <<'EOF_MENU'
 [Docker 离线安装 - 二进制部署，无需网络/包管理器]
 1) 下载 Docker & Compose 二进制资源
@@ -1746,7 +1745,7 @@ EOF_MENU
 read -r -p "选择: " c; case "${c:-}" in 1) menu_action "检查更新" system_update_check ;; 2) menu_action "安装安全更新" system_update_security ;; 3) menu_action "更新所有包" system_update_all ;; 0) return ;; *) menu_invalid ;; esac; done; }
 main_menu() { local c; while true; do menu_clear; cat <<EOF_MENU
 Linux/macOS Admin Toolkit v${TOOL_VERSION}
-系统：${OS_NAME} (${PLATFORM:-unknown})    包管理器：${PKG_MANAGER:-unknown}
+系统：${OS_NAME} (${PLATFORM:-unknown})    包管理器：${PKG_MANAGER:-unknown}$( [[ "$DRY_RUN" -eq 1 ]] && printf '    [dry-run 模式：只打印不执行]' )
 
 1) 常用工具安装/配置
 2) 系统镜像源 / Homebrew 镜像
@@ -1769,11 +1768,26 @@ usage() { cat <<EOF_USAGE
 用法：
   $PROGRAM_NAME [全局选项] [模块] [动作] [参数]
 
-全局选项：
+全局选项（可放在命令行任意位置）：
   -y, --yes       默认确认
   -n, --dry-run   只打印不执行
   --no-color      禁用颜色
-  -h, --help      查看帮助
+  -h, --help      查看帮助（仅开头位置）
+
+模块与动作：
+  tools        install | status | config [all|vim|tmux|git|zsh-basic] | oh-my-zsh | zsh-plugins | install-z | zsh-full | chsh-zsh
+  mirror       backup | set [--source 源] | list-backups | restore [名称] | refresh
+  docker       install [--source 源] | mirror [--registry URL] | save-images [--dir 目录] | status | uninstall [--remove-data 1]
+  docker-offline  download | install | package | uninstall | status | help（选项见 help）
+  firewall     install | status | enable | disable | allow <规则> | deny <规则> | uninstall
+  swap         list | add [--size N] [--path 路径] | resize [--size N] [--path 路径] | delete [--path 路径]
+  lvm          create | create-vg | create-lv | create-pv | extend | delete | list | info | sizes | install | help
+  perf         quick | install-tools
+  service      list | status <服务> | restart <服务> | enable <服务> | disable <服务> | logs <服务> [行数]
+  disk-cleanup summary | journal [--days N] | old-kernels | packages | docker
+  ssl-check    <域名> [端口]（默认 443）
+  ssl-check-batch <文件>
+  system-update check | security | all
 
 模块示例：
   $PROGRAM_NAME menu
@@ -1816,8 +1830,71 @@ usage() { cat <<EOF_USAGE
   $PROGRAM_NAME system-update all
 EOF_USAGE
 }
-get_opt_value() { local key="$1" arg next; shift || true; while [[ "$#" -gt 0 ]]; do arg="$1"; case "$arg" in "$key") shift || true; next="${1:-}"; [[ -n "$next" ]] || return 1; printf '%s' "$next"; return 0 ;; "$key"=*) printf '%s' "${arg#*=}"; return 0 ;; esac; shift || true; done; return 1; }
-main() { detect_os; load_config; audit_log "START: $0 $*"; while [[ "$#" -gt 0 ]]; do case "${1:-}" in -y|--yes) ASSUME_YES=1; shift ;; -n|--dry-run) DRY_RUN=1; shift ;; --no-color) NO_COLOR=1; shift ;; -h|--help) usage; exit 0 ;; *) break ;; esac; done; local module="${1:-menu}" action="${2:-}"; case "$module" in menu|"") require_root "$@"; main_menu ;; env) print_env ;; tools) require_root "$@"; case "${action:-}" in install) install_common_tools ;; status) tool_status ;; config) case "${3:-all}" in all) configure_common_tools ;; vim) configure_vim ;; tmux) configure_tmux ;; git) configure_git ;; zsh-basic) configure_zsh_basic ;; *) fatal "未知 tools config 动作：${3:-}" ;; esac ;; oh-my-zsh) install_oh_my_zsh "$(get_opt_value --github-proxy "$@" || true)" ;; zsh-plugins) install_zsh_plugins "$(get_opt_value --github-proxy "$@" || true)" ;; install-z) install_rupa_z "$(get_opt_value --github-proxy "$@" || true)" ;; zsh-full) configure_zsh_full ;; chsh-zsh) change_default_shell_to_zsh ;; *) fatal "未知 tools 动作：${action:-}" ;; esac ;; mirror) require_root "$@"; case "${action:-}" in backup) backup_sources ;; set) set_system_mirror "$(get_opt_value --source "$@" || printf '%s' "$DEFAULT_SOURCE")" ;; list-backups) list_source_backups ;; restore) restore_sources "${3:-}" ;; refresh) refresh_pkg_cache ;; *) fatal "未知 mirror 动作：${action:-}" ;; esac ;; docker) require_root "$@"; case "${action:-}" in install) install_docker "$(get_opt_value --source "$@" || printf '%s' "$DEFAULT_DOCKER_SOURCE")" ;; mirror) configure_docker_registry_mirror "$(get_opt_value --registry "$@" || true)" ;; save-images) save_docker_images_one_by_one "$(get_opt_value --dir "$@" || true)" ;; status) menu_docker_status ;; uninstall) uninstall_docker "$(get_opt_value --remove-data "$@" || printf '0')" ;; *) fatal "未知 docker 动作：${action:-}" ;; esac ;; firewall) require_root "$@"; case "${action:-}" in install) install_firewall ;; status) firewall_status ;; enable) firewall_enable ;; disable) firewall_disable ;; allow) firewall_allow "${3:-}" ;; deny) firewall_deny "${3:-}" ;; uninstall) uninstall_firewall ;; *) fatal "未知 firewall 动作：${action:-}" ;; esac ;; swap) require_root "$@"; case "${action:-}" in list) swap_list ;; add) swap_add "$(get_opt_value --size "$@" || true)" "$(get_opt_value --path "$@" || printf '/swapfile')" ;; resize) swap_resize "$(get_opt_value --size "$@" || true)" "$(get_opt_value --path "$@" || printf '/swapfile')" ;; delete) swap_delete "$(get_opt_value --path "$@" || true)" ;; *) fatal "未知 swap 动作：${action:-}" ;; esac ;; lvm) require_root "$@"; lvm_main "${@:2}" ;; perf) case "${action:-quick}" in quick) perf_quick ;; install-tools) ensure_perf_tools ;; *) fatal "未知 perf 动作：${action:-}" ;; esac ;; docker-offline) require_root "$@"; shift 2; case "${action:-}" in help) cat <<'EOF_OFFLINE_HELP'
+get_opt_value() { local key="$1" arg next; shift || true; while [[ "$#" -gt 0 ]]; do arg="$1"; case "$arg" in "$key") shift || true; next="${1:-}"; [[ -n "$next" && "$next" != -* ]] || return 1; printf '%s' "$next"; return 0 ;; "$key"=*) printf '%s' "${arg#*=}"; return 0 ;; esac; shift || true; done; return 1; }
+# ---------- CLI 分发 ----------
+cmd_tools() {
+  local action="${2:-}"
+  case "$action" in
+    install) tools_install ;;
+    status) tools_status ;;
+    config) case "${3:-all}" in all) tools_config_all ;; vim) tools_config_vim ;; tmux) tools_config_tmux ;; git) tools_config_git ;; zsh-basic) tools_config_zsh_basic ;; *) fatal "未知 tools config 动作：${3:-}" ;; esac ;;
+    oh-my-zsh) tools_install_oh_my_zsh "$(get_opt_value --github-proxy "$@" || true)" ;;
+    zsh-plugins) tools_install_zsh_plugins "$(get_opt_value --github-proxy "$@" || true)" ;;
+    install-z) tools_install_rupa_z "$(get_opt_value --github-proxy "$@" || true)" ;;
+    zsh-full) tools_config_zsh_full ;;
+    chsh-zsh) tools_change_shell_to_zsh ;;
+    *) fatal "未知 tools 动作：${action:-}" ;;
+  esac
+}
+cmd_mirror() {
+  local action="${2:-}"
+  case "$action" in
+    backup) mirror_backup ;;
+    set) mirror_set "$(get_opt_value --source "$@" || printf '%s' "$DEFAULT_SOURCE")" ;;
+    list-backups) mirror_list_backups ;;
+    restore) mirror_restore "${3:-}" ;;
+    refresh) refresh_pkg_cache ;;
+    *) fatal "未知 mirror 动作：${action:-}" ;;
+  esac
+}
+cmd_docker() {
+  local action="${2:-}"
+  case "$action" in
+    install) docker_install "$(get_opt_value --source "$@" || printf '%s' "$DEFAULT_DOCKER_SOURCE")" ;;
+    mirror) docker_configure_registry_mirror "$(get_opt_value --registry "$@" || true)" ;;
+    save-images) docker_save_images "$(get_opt_value --dir "$@" || true)" ;;
+    status) menu_docker_status ;;
+    uninstall) docker_uninstall "$(get_opt_value --remove-data "$@" || printf '0')" ;;
+    *) fatal "未知 docker 动作：${action:-}" ;;
+  esac
+}
+cmd_firewall() {
+  local action="${2:-}"
+  case "$action" in
+    install) install_firewall ;;
+    status) firewall_status ;;
+    enable) firewall_enable ;;
+    disable) firewall_disable ;;
+    allow) firewall_allow "${3:-}" ;;
+    deny) firewall_deny "${3:-}" ;;
+    uninstall) uninstall_firewall ;;
+    *) fatal "未知 firewall 动作：${action:-}" ;;
+  esac
+}
+cmd_swap() {
+  local action="${2:-}"
+  case "$action" in
+    list) swap_list ;;
+    add) swap_add "$(get_opt_value --size "$@" || true)" "$(get_opt_value --path "$@" || printf '/swapfile')" ;;
+    resize) swap_resize "$(get_opt_value --size "$@" || true)" "$(get_opt_value --path "$@" || printf '/swapfile')" ;;
+    delete) swap_delete "$(get_opt_value --path "$@" || true)" ;;
+    *) fatal "未知 swap 动作：${action:-}" ;;
+  esac
+}
+cmd_docker_offline() {
+  local action="${2:-}"
+  case "$action" in
+    help) cat <<'EOF_OFFLINE_HELP'
 docker-offline 模块：离线二进制安装 Docker Engine + Docker Compose
 
 动作：
@@ -1840,5 +1917,107 @@ docker-offline 模块：离线二进制安装 Docker Engine + Docker Compose
   --package-file FILE      package 输出文件名
   --purge-data             uninstall 时同时删除数据
 EOF_OFFLINE_HELP
-;; status) offline_action_status ;; *) offline_parse_args "$@"; case "${action:-}" in download) offline_action_download ;; install) offline_action_install ;; package) offline_action_package ;; uninstall) offline_action_uninstall ;; *) fatal "未知 docker-offline 动作：${action:-}。支持：download/install/package/uninstall/status/help" ;; esac ;; esac ;; service) require_root "$@"; case "${action:-}" in list) svc_list ;; status) svc_status "${3:-}" ;; restart) svc_restart "${3:-}" ;; enable) svc_enable "${3:-}" ;; disable) svc_disable "${3:-}" ;; logs) svc_logs "${3:-}" "${4:-50}" ;; *) fatal "未知 service 动作：${action:-}。支持：list/status/restart/enable/disable/logs" ;; esac ;; disk-cleanup) require_root "$@"; case "${action:-}" in summary) disk_cleanup_summary ;; journal) disk_cleanup_journal "$(get_opt_value --days "$@" || printf '7')" ;; old-kernels) disk_cleanup_old_kernels ;; packages) disk_cleanup_packages ;; docker) disk_cleanup_docker ;; *) fatal "未知 disk-cleanup 动作：${action:-}。支持：summary/journal/old-kernels/packages/docker" ;; esac ;; ssl-check) ssl_check "${3:-}" "${4:-443}" ;; ssl-check-batch) ssl_check_batch "${3:-}" ;; system-update) require_root "$@"; case "${action:-}" in check) system_update_check ;; security) system_update_security ;; all) system_update_all ;; *) fatal "未知 system-update 动作：${action:-}。支持：check/security/all" ;; esac ;; *) usage; fatal "未知模块：${module}" ;; esac; }
+    ;;
+    status) offline_action_status ;;
+    *)
+      shift 2
+      offline_parse_args "$@"
+      case "$action" in
+        download) offline_action_download ;;
+        install) offline_action_install ;;
+        package) offline_action_package ;;
+        uninstall) offline_action_uninstall ;;
+        *) fatal "未知 docker-offline 动作：${action:-}。支持：download/install/package/uninstall/status/help" ;;
+      esac
+      ;;
+  esac
+}
+cmd_service() {
+  local action="${2:-}"
+  case "$action" in
+    list) svc_list ;;
+    status) svc_status "${3:-}" ;;
+    restart) svc_restart "${3:-}" ;;
+    enable) svc_enable "${3:-}" ;;
+    disable) svc_disable "${3:-}" ;;
+    logs) svc_logs "${3:-}" "${4:-50}" ;;
+    *) fatal "未知 service 动作：${action:-}。支持：list/status/restart/enable/disable/logs" ;;
+  esac
+}
+cmd_disk_cleanup() {
+  local action="${2:-}"
+  case "$action" in
+    summary) disk_cleanup_summary ;;
+    journal) disk_cleanup_journal "$(get_opt_value --days "$@" || printf '7')" ;;
+    old-kernels) disk_cleanup_old_kernels ;;
+    packages) disk_cleanup_packages ;;
+    docker) disk_cleanup_docker ;;
+    *) fatal "未知 disk-cleanup 动作：${action:-}。支持：summary/journal/old-kernels/packages/docker" ;;
+  esac
+}
+cmd_perf() {
+  local action="${2:-quick}"
+  case "$action" in
+    quick) perf_quick ;;
+    install-tools) ensure_perf_tools ;;
+    *) fatal "未知 perf 动作：${action:-}" ;;
+  esac
+}
+cmd_system_update() {
+  local action="${2:-}"
+  case "$action" in
+    check) system_update_check ;;
+    security) system_update_security ;;
+    all) system_update_all ;;
+    *) fatal "未知 system-update 动作：${action:-}。支持：check/security/all" ;;
+  esac
+}
+main() {
+  detect_os; load_config; audit_log "START: $0 $*"
+  local module="${1:-menu}" rest=()
+  # 全局选项任意位置：-y/--yes、-n/--dry-run、--no-color；-h/--help 仅在开头
+  while [[ "$#" -gt 0 ]]; do
+    case "${1:-}" in
+      -y|--yes) ASSUME_YES=1; shift ;;
+      -n|--dry-run) DRY_RUN=1; shift ;;
+      --no-color) NO_COLOR=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) break ;;
+    esac
+  done
+  module="${1:-menu}"; shift || true
+  while [[ "$#" -gt 0 ]]; do
+    case "${1:-}" in
+      -y|--yes) ASSUME_YES=1 ;;
+      -n|--dry-run) DRY_RUN=1 ;;
+      --no-color) NO_COLOR=1 ;;
+      *) rest+=("$1") ;;
+    esac
+    shift
+  done
+  set -- "${rest[@]}"
+  # 权限统一：查询类模块（env/perf/ssl-check）无需 root，其余需要
+  case "$module" in
+    env|perf|ssl-check|ssl-check-batch) : ;;
+    *) require_root "$@" ;;
+  esac
+  case "$module" in
+    menu|"") main_menu ;;
+    env) print_env ;;
+    tools) cmd_tools "$module" "$@" ;;
+    mirror) cmd_mirror "$module" "$@" ;;
+    docker) cmd_docker "$module" "$@" ;;
+    docker-offline) cmd_docker_offline "$module" "$@" ;;
+    firewall) cmd_firewall "$module" "$@" ;;
+    swap) cmd_swap "$module" "$@" ;;
+    lvm) lvm_main "$@" ;;
+    perf) cmd_perf "$module" "$@" ;;
+    service) cmd_service "$module" "$@" ;;
+    disk-cleanup) cmd_disk_cleanup "$module" "$@" ;;
+    ssl-check) ssl_check "${1:-}" "${2:-443}" ;;
+    ssl-check-batch) ssl_check_batch "${1:-}" ;;
+    system-update) cmd_system_update "$module" "$@" ;;
+    *) usage; fatal "未知模块：${module}" ;;
+  esac
+}
 main "$@"
